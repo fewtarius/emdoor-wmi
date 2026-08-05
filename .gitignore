@@ -1,0 +1,19 @@
+# Build artifacts (in-tree kernel module build)
+*.o
+*.o.cmd
+*.ko
+*.ko.cmd
+*.mod
+*.mod.cmd
+*.mod.c
+*.mod.o
+*.mod.o.cmd
+*~
+.*.cmd
+.modules.order
+Module.symvers
+modules.order
+
+# CLIO (managed automatically)
+.clio/*
+!.clio/instructions.md
