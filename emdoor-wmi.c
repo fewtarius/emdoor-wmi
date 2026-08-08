@@ -86,6 +86,19 @@ module_param(force_load, bool, 0444);
 MODULE_PARM_DESC(force_load,
 		 "Skip DMI whitelist (for diagnostics on unrecognised hardware)");
 
+/*
+ * Boot-time charge threshold override.
+ *   -1 (default): leave whatever the firmware / EC last had alone.
+ *    0..100    : on charge-probe, write this value to EC MXCP (with the
+ *                firmware-enforced MICP = MXCP - 1). Useful when userspace
+ *                (tlp, auto-cpufreq, custom units) can't be relied on to
+ *                run early enough, e.g. headless boots.
+ */
+static int default_charge_end_threshold = -1;
+module_param(default_charge_end_threshold, int, 0444);
+MODULE_PARM_DESC(default_charge_end_threshold,
+		 "Probe-time charge_control_end_threshold (-1 = no override; 0..100 = write MXCP)");
+
 static int emd_dmi_check(void)
 {
 	if (force_load)
@@ -119,8 +132,15 @@ static int emd_dmi_check(void)
 #define EMD_EC_REG_FN1H			0x76
 #define EMD_EC_REG_FN1L			0x77
 #define EMD_EC_REG_ECWR			0x78
-#define EMD_EC_REG_MICP			0xBB
-#define EMD_EC_REG_MXCP			0xBC
+/*
+ * Charge-threshold registers. The DSDT's OperationRegion(ECF2) field
+ * declaration (DSDT.dsl around line 8766) names 0xBB as MXCP (max charge
+ * percent) and 0xBC as MICP (min charge percent). The firmware's WMDD
+ * method mirrors this: it writes Arg2 to MXCP and (Arg2 - 1) to MICP.
+ * Match the firmware; do not "fix" the apparent swap.
+ */
+#define EMD_EC_REG_MXCP			0xBB
+#define EMD_EC_REG_MICP			0xBC
 
 /* CMS mailbox for power-limit writes (I/O ports 0x72/0x73). */
 #define EMD_CMS_CMD_PORT		0x72
@@ -747,9 +767,31 @@ static int emd_charge_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	dev_info(&pdev->dev,
-		 "EmdAcpi charge control registered (MICP=%u, MXCP=%u)\n",
-		 micp, mxcp);
+	if (default_charge_end_threshold >= 0) {
+		if (default_charge_end_threshold > 100) {
+			dev_warn(&pdev->dev,
+				 "default_charge_end_threshold=%d out of range; leaving EC at MXCP=%u\n",
+				 default_charge_end_threshold, mxcp);
+		} else {
+			u8 new_mxcp = (u8)default_charge_end_threshold;
+			ret = emd_charge_set_mxcp(priv, new_mxcp);
+			if (ret) {
+				dev_err(&pdev->dev,
+					"failed to apply default_charge_end_threshold=%d: %d\n",
+					new_mxcp, ret);
+			} else {
+				dev_info(&pdev->dev,
+					 "EmdAcpi charge control registered (MICP=%u, MXCP=%u -> %u via default_charge_end_threshold)\n",
+					 micp, mxcp, new_mxcp);
+				mxcp = new_mxcp;
+				micp = new_mxcp > 0 ? new_mxcp - 1 : 0;
+			}
+		}
+	} else {
+		dev_info(&pdev->dev,
+			 "EmdAcpi charge control registered (MICP=%u, MXCP=%u)\n",
+			 micp, mxcp);
+	}
 	return 0;
 }
 

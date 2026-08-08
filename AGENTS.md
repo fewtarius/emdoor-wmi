@@ -25,6 +25,9 @@ README.md             user-facing: what it does, sysfs paths, build, load
 ../ecwmi/ecwmi.c      ECWR trigger + raw PWMD/TLID sysfs
 ../ecwmi/Makefile
 ../analysis/EC-RAM-MAP.md            DSDT field map (offset + name)
+**Note:** `../analysis/EC-RAM-MAP.md` is an early annotation that mislabels
+0xBB/0xBC. The DSDT's `OperationRegion(ECF2)` field declaration in
+`../acpi_dump/DSDT.dsl` is the source of truth.
 ../analysis/ACPI-FIRMWARE-EXTRACTION.md  WMI call table + WMDD internals
 ../analysis/LINUX-IMPLEMENTATION-MAP.md  design notes from before the driver existed
 ../acpi_dump/DSDT.dsl                decompiled DSDT (canonical AML reference)
@@ -66,12 +69,18 @@ Authoritative source: `../analysis/EC-RAM-MAP.md` (DSDT line 8680). Registers th
 | 0x76/0x77 | FN1H/FN1L | Fan 1 RPM (big-endian) |
 | 0x78 | ECWR | Power-limit refresh trigger |
 | 0x7C | PWMD | Power mode (1=quiet, 2=balance, 3=perf) |
-| 0xBB | MICP | Min charge percent |
-| 0xBC | MXCP | Max charge percent |
+| 0xBB | MXCP | Max charge percent (firmware enforces MICP = MXCP - 1) |
+| 0xBC | MICP | Min charge percent |
 
 CMS mailbox (for `power[1-6]_cap`): cmd port 0x72, data port 0x73, ALIB command 0x0C. Sequence: `outb(0x0C, 0x72) -> udelay(1) -> outb(reg, 0x73) -> udelay(1) -> outl(value, 0x73) -> udelay(10)`.
 
-The DSDT field labels for MICP/MXCP (line 8766) and `../analysis/EC-RAM-MAP.md` swap the names of 0xBB and 0xBC relative to firmware behaviour and the WMDD source code. The driver's register definitions match actual firmware semantics (0xBB=MICP, 0xBC=MXCP); the firmware's reset defaults are 0xBB=0, 0xBC=100, which only makes sense with that mapping.
+The DSDT's `OperationRegion(ECF2)` field declaration (around line 8766) names
+0xBB as MXCP and 0xBC as MICP. The firmware's WMDD method mirrors this:
+`ECWT(Arg2, MXCP); ECWT(Arg2 - 1, MICP)`. The driver's register defines
+match the DSDT exactly — do not "correct" the apparent swap; it is correct.
+Empirical check: `echo 100 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold`
+must leave `ectool -r 0xBB` = 100 and `ectool -r 0xBC` = 99. If the values
+are inverted, the driver has regressed to the wrong mapping.
 
 ## Why EC IO Only
 
@@ -79,7 +88,7 @@ The EmdAcpi `WMxx` methods declare a 63-bit `BufferField` at offset `0x20` of an
 
 We route around the broken methods:
 - `WMBF` (power-mode): value is at EC PWMD (0x7C). Driver writes/reads PWMD directly; `WMBF` is never evaluated.
-- `WMDD` (charge ratio): EC's MICP/MXCP (0xBB/0xBC) carry the same values. Direct EC IO.
+- `WMDD` (charge ratio): EC's MICP/MXCP (0xBC/0xBB) carry the same values. Direct EC IO.
 - `WMDA` (keyboard): well-formed (0x50-byte local buffer). Evaluated via `wmidev_evaluate_method()`.
 
 There is no `quirk_broken_wmbf` flag any more. Power and charge never probe broken WMI methods; no ACPI errors at load.
@@ -238,11 +247,7 @@ emdoor-wmi: <subsystem>: <one-line description>
 
 <What changed and why. Reference EC register offsets if applicable.>
 
-Tested-by: <hardware owner and platform>
-Signed-off-by: <author>
 ```
-
-`Signed-off-by` mandatory for kernel work (DCO). Use `git commit -s`.
 
 ### Pre-commit checklist
 
@@ -250,7 +255,6 @@ Signed-off-by: <author>
 - [ ] `modinfo` shows correct metadata
 - [ ] No commented-out code blocks (`test_zones.sh` is the only intentional shell exception)
 - [ ] Hardware smoke tests pass (Power, Fan, Battery, RGB, ecwmi if applicable)
-- [ ] `Signed-off-by` line
 
 ## Anti-Patterns
 
