@@ -59,6 +59,7 @@
 #include <linux/errno.h>
 #include <linux/device.h>
 #include <linux/dmi.h>
+#include <linux/hwmon.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/led-class-multicolor.h>
@@ -114,7 +115,7 @@ static int emd_dmi_check(void)
 
 /*
  * Fan control via EC registers (from DSDT ECF2 OperationRegion):
- *   XXTT (0x03): Fan control command/data port. Write 0x11 to arm
+ *   XXTT (0x30): Fan control command/data port. Write 0x11 to arm
  *                fan control before writing TLID.
  *   TLID (0x32): Fan mode parameter (1=auto, 2=max).
  *   FN1H (0x76): Fan 1 RPM high byte.
@@ -124,7 +125,7 @@ static int emd_dmi_check(void)
  * bit offset 0x20 with 0x3F width extends past the 8-byte buffer,
  * causing AE_AML_BUFFER_LIMIT), so we use direct EC I/O instead.
  */
-#define EMD_EC_REG_XXTT              0x03
+#define EMD_EC_REG_XXTT              0x30
 #define EMD_EC_REG_TLID              0x32
 #define EMD_EC_REG_FN1H              0x76
 #define EMD_EC_REG_FN1L              0x77
@@ -336,7 +337,63 @@ struct emd_return {
 struct emd_power_priv {
 	struct wmi_device *wdev;
 	bool quirk_broken_wmbf;
+	struct device *hwmon_dev;
 };
+
+/*
+ * Hwmon-compatible fan control attributes.
+ * Exposes fan1_input (RPM) and fan_mode via /sys/class/hwmon/ so that
+ * lm-sensors, fancontrol, and other standard tools can access them.
+ */
+static ssize_t hwmon_fan1_input_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct emd_power_priv *priv = dev_get_drvdata(dev);
+	u16 rpm;
+	int ret;
+
+	ret = emd_fan_get_speed(priv->wdev, &rpm);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", rpm);
+}
+
+static ssize_t hwmon_fan_mode_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	u8 mode;
+	int ret;
+
+	ret = ec_read(EMD_EC_REG_TLID, &mode);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", mode);
+}
+
+static ssize_t hwmon_fan_mode_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct emd_power_priv *priv = dev_get_drvdata(dev);
+	unsigned long mode;
+	int ret;
+
+	ret = kstrtoul(buf, 0, &mode);
+	if (ret)
+		return ret;
+	if (mode != EMD_FAN_AUTO && mode != EMD_FAN_MAX)
+		return -EINVAL;
+
+	ret = emd_fan_set_mode(priv->wdev, (u8)mode);
+	return ret ?: count;
+}
+
+static struct device_attribute dev_attr_fan1_input =
+	__ATTR(fan1_input, 0444, hwmon_fan1_input_show, NULL);
+static struct device_attribute dev_attr_fan_mode_hwmon =
+	__ATTR(fan_mode, 0644, hwmon_fan_mode_show, hwmon_fan_mode_store);
 
 static int emd_ec_pwmd_read(struct emd_power_priv *priv, u8 *val)
 {
@@ -555,6 +612,22 @@ static int emd_power_probe(struct wmi_device *wdev, const void *context)
 	if (ret)
 		dev_warn(&wdev->dev, "failed to create fan_mode attr: %d\n", ret);
 
+	/* Register hwmon device for standard tool access (/sys/class/hwmon/) */
+	priv->hwmon_dev = devm_hwmon_device_register_with_info(&wdev->dev,
+				"emdoor_fan", priv, NULL, NULL);
+	if (IS_ERR(priv->hwmon_dev)) {
+		ret = PTR_ERR(priv->hwmon_dev);
+		dev_warn(&wdev->dev, "failed to register hwmon device: %d\n", ret);
+		priv->hwmon_dev = NULL;
+	} else {
+		ret = device_create_file(priv->hwmon_dev, &dev_attr_fan1_input);
+		if (ret)
+			dev_warn(&wdev->dev, "failed to create fan1_input attr: %d\n", ret);
+		ret = device_create_file(priv->hwmon_dev, &dev_attr_fan_mode_hwmon);
+		if (ret)
+			dev_warn(&wdev->dev, "failed to create fan_mode hwmon attr: %d\n", ret);
+	}
+
 	dev_info(&wdev->dev,
 		 "EmdAcpi power mode bound (current=%d, %s)\n",
 		 probe_val,
@@ -564,9 +637,15 @@ static int emd_power_probe(struct wmi_device *wdev, const void *context)
 
 static void emd_power_remove(struct wmi_device *wdev)
 {
+	struct emd_power_priv *priv = dev_get_drvdata(&wdev->dev);
+
 	device_remove_file(&wdev->dev, &dev_attr_ecwr);
 	device_remove_file(&wdev->dev, &dev_attr_fan_speed);
 	device_remove_file(&wdev->dev, &dev_attr_fan_mode);
+	if (priv->hwmon_dev) {
+		device_remove_file(priv->hwmon_dev, &dev_attr_fan1_input);
+		device_remove_file(priv->hwmon_dev, &dev_attr_fan_mode_hwmon);
+	}
 }
 
 static const struct wmi_device_id emd_power_id_table[] = {
