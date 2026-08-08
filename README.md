@@ -5,8 +5,13 @@ and MetaMech laptop PCs. Provides:
 
 - `platform_profile` integration: select Performance, Balanced, or
   Quiet via standard Linux sysfs.
+- Battery charge ratio control: read MICP/MXCP and write charge limits
+  via `WMDD` (with EC fallback).
+- Power limit override: write PL1-PL3, SYS_PL, GPU_PL via EC CMS
+  mailbox.
 - Six-zone RGB control: four keyboard regions plus the two chassis
   side bars, exposed as Linux multicolor LED class devices.
+- ECWR trigger: force EC to re-apply power limits for current mode.
 
 The driver targets the AML produced by Emdoor's "EmdAcpi" compiler and
 the EC firmware that pairs with it. It is **not** intended for
@@ -32,11 +37,14 @@ make Linux ACPICA accept the methods. We route around them:
 - `WMDA` (keyboard): the method is well-formed (0x50-byte local
   buffer instead of 0x08), so we evaluate it directly via
   `wmidev_evaluate_method()`.
+- `WMDD` (battery charge ratio): parses cleanly with an 8-byte
+  buffer. The driver tries the WMI path first and falls back to
+  direct EC reads/writes of MICP (0xBB) and MXCP (0xBC) on failure.
 
-Because `WMBF` may evaluate on healthy firmware and fail on broken
-firmware, the driver probes the WMI path on `WMBF` first and
-switches to the EC path transparently. The user-visible behaviour is
-the same in either case.
+Because `WMBF` and `WMDD` may evaluate on healthy firmware and fail on
+broken firmware, the driver probes the WMI path first and switches to
+the EC path transparently. The user-visible behaviour is the same in
+either case.
 
 ## Supported hardware
 
@@ -81,7 +89,7 @@ exposes the standard interface at:
 | --- | --- | --- |
 | `profile` | rw | `low-power`, `balanced`, `performance` |
 | `choices` | ro | the three values above, space-separated |
-| `name` | ro | `emdoor-power` |
+| `name` | ro | `epm` |
 
 Power-mode select values in the ECPM enumeration:
 
@@ -96,6 +104,93 @@ that case on healthy firmware and the EC path on broken firmware,
 transparently. The kernel's `platform_profile` core persists the
 last-selected profile across reboots; the EC firmware stores the
 current profile in `PWMD` so both paths agree on reload.
+
+### ECWR attribute
+
+```
+/sys/bus/wmi/devices/4BCA6480-4D03-4674-84CB-26B4C8F5CFC2-10/ecwr
+```
+
+Write-only attribute that triggers the EC's E4 interrupt handler to
+re-apply power limits for the current mode. Used for debugging and
+manual limit refresh after CMS mailbox changes.
+
+## Battery Charge Ratio (WMDD)
+
+GUID `6B40A935-7FEF-42B6-B08D-6C79B57D6C35`. Bound as `emdoor-charge`.
+
+The driver exposes three sysfs attributes on the WMI device for controlling
+the battery charge thresholds via the EC's MICP (Min Charge Percent) and
+MXCP (Max Charge Percent) registers:
+
+```
+/sys/bus/wmi/devices/6B40A935-7FEF-42B6-B08D-6C79B57D6C35-11/
+├── charge_micp              ro
+├── charge_mxcp              ro
+└── charge_ratio             wo
+```
+
+| Attribute | Access | Description |
+| --- | --- | --- |
+| `charge_micp` | ro | Current minimum charge percent (0-100) |
+| `charge_mxcp` | ro | Current maximum charge percent (0-100) |
+| `charge_ratio` | wo | Write new charge limit; sets MXCP=val, MICP=val-1 |
+
+The driver tries the WMI path first (`WMDD` case 1 for read, case 2 for
+write). If the firmware method fails, it falls back to direct EC IO on
+registers `0xBB` (MICP) and `0xBC` (MXCP), latching a per-device quirk
+flag so subsequent operations use the EC path directly.
+
+Per the DSDT, `WMDD` case 2 writes `Arg2` to MXCP and `Arg2-1` to MICP.
+The `charge_ratio` attribute accepts a single value (0-255, typically
+50-100) and applies this mapping automatically.
+
+This is a write-only control for the charge limit; there is no firmware
+readback path for the current charge *level* (that comes from the standard
+battery sysfs).
+
+## Power Limit Override (CMS mailbox)
+
+The EC exposes a Command/Data mailbox at I/O ports `0x72`/`0x73`.
+Command `0x0C` (ALIB) writes a 32-bit value to a specific register:
+
+```
+outb(0x0C, 0x72) -> outb(reg, 0x73) -> outl(value, 0x73)
+```
+
+The driver creates a platform device `emdoor-power-limits` with a
+`power_limits` sysfs group containing write-only attributes for each
+power limit register:
+
+```
+/sys/devices/platform/emdoor-power-limits/power_limits/
+├── pl1              wo (sustained power limit, mW)
+├── pl2              wo (short turbo limit, mW)
+├── pl3              wo (peak power limit, mW)
+├── pl1_dup          wo (PL1 duplicate, some firmware mirrors PL1 here)
+├── sys_pl           wo (system total power limit, mW)
+└── gpu_pl           wo (GPU power limit, mW)
+```
+
+All values are in **milliwatts**. Reads return `write-only (mW)` as a
+reminder of the units. This interface is intended for debugging and
+manual tuning; the EC firmware manages limits automatically based on
+the current power mode (see `ecwr` below).
+
+## ECWR - Power Limit Refresh
+
+The power mode driver also exposes a write-only `ecwr` attribute on the
+WMI device:
+
+```
+/sys/bus/wmi/devices/4BCA6480-4D03-4674-84CB-26B4C8F5CFC2-10/ecwr
+```
+
+Writing any non-zero value triggers the EC's E4 interrupt handler,
+forcing it to re-evaluate the current power mode and re-apply the
+corresponding PL1/PL2/PL3 limits. This is useful when manually
+adjusting limits via the CMS mailbox and wanting them to take effect
+immediately without a power mode change.
 
 ## Keyboard RGB
 
@@ -140,20 +235,33 @@ re-arm the LLBR channel and re-introduce the chassis bars.
 
 ### Sysfs attributes
 
-Under the keyboard WMI device:
+The `type` attribute lives on the keyboard WMI device. The `mode` and
+`modes` attributes live on a dedicated `emdoor:rgb:mode` LED class
+device, which is a virtual LED class device (no real LEDs) that exists
+purely as a control surface under `/sys/class/leds/`. Putting them
+under the LED class subsystem lets SteamOS's
+`70-steam-jupiter-leds.rules` udev rule auto-chown the `mode` file
+to `deck:deck`, so Decky Loader (running as the `deck` user) can
+switch animation modes without root.
 
 ```
 /sys/bus/wmi/devices/8600ACCE-FB9B-443E-86F4-3C867398AAE5-12/
-├── type                    ro
+└── type                    ro
+```
+
+```
+/sys/class/leds/emdoor:rgb:mode/
 ├── mode                    rw
-└── modes                   ro
+├── modes                   ro
+├── brightness              rw   (no-op; control-surface only)
+└── max_brightness          ro   (= 1)
 ```
 
 | Attribute | Values |
 | --- | --- |
-| `type` | `4zone` (only supported value) |
-| `mode` | any of the values listed in `modes` (see below) |
-| `modes` | space-separated list of all valid values for `mode` |
+| `type` (WMI) | `4zone` (only supported value) |
+| `mode` (LED class) | any of the values listed in `modes` (see below) |
+| `modes` (LED class) | space-separated list of all valid values for `mode` |
 
 `modes` mirrors the kernel's `platform_profile_choices` sysfs
 attribute: read-only, space-separated list of all valid values
@@ -161,7 +269,14 @@ accepted by `mode`. Userspace can read it to discover the supported
 set without hardcoding the OEM names. The set is fixed at module
 load and does not change at runtime.
 
-Under `/sys/class/leds/`:
+The `emdoor:rgb:mode` LED class device is a control surface, not a
+real LED. Its `brightness` and `max_brightness` attributes are
+standard LED class boilerplate; writing to `brightness` is a no-op
+because there is no LED to set. The `mode` and `modes` files are
+the actual interface.
+
+Under `/sys/class/leds/` the six zone multicolor LED class devices
+also live here:
 
 ```
 emdoor:multicolor:zone1
@@ -221,7 +336,9 @@ On probe the driver:
    per-key) deliberately do not bind; the BST2 wire format is
    meaningless to them.
 2. Registers six multicolor LED class devices, one per logical zone.
-3. Registers the `type`, `mode`, and `modes` attributes.
+3. Registers the `type` attribute on the WMI device and the
+   `mode` / `modes` attributes on the `emdoor:rgb:mode` LED class
+   control surface.
 4. **Does not** apply an initial RGB state. The hardware is left
    exactly as the firmware last had it, so a reload does not stomp
    the user's colours.
@@ -291,10 +408,17 @@ whitelist gates the bind.
 
 ```sh
 # Confirm the WMI devices exist
-ls /sys/bus/wmi/devices/ | grep -E '4BCA|8600ACCE'
+ls /sys/bus/wmi/devices/ | grep -E '4BCA|8600ACCE|6B40A935'
 
 # List valid modes
-cat /sys/bus/wmi/devices/8600ACCE-FB9B-443E-86F4-3C867398AAE5-12/modes
+cat /sys/class/leds/emdoor:rgb:mode/modes
+
+# Check battery charge ratio
+cat /sys/bus/wmi/devices/6B40A935-7FEF-42B6-B08D-6C79B57D6C35-11/charge_micp
+cat /sys/bus/wmi/devices/6B40A935-7FEF-42B6-B08D-6C79B57D6C35-11/charge_mxcp
+
+# Check power limit override interface
+ls /sys/devices/platform/emdoor-power-limits/power_limits/
 
 # Tail the kernel ring buffer
 sudo dmesg -w | grep -E 'emdoor|EmdAcpi'
@@ -304,9 +428,10 @@ Probe failure modes and what they mean:
 
 | Symptom | Likely cause |
 | --- | --- |
-| No `emdoor-power` or `emdoor-kbd` devices | DMI whitelist did not match (load with `force_load=1` to confirm) |
+| No `emdoor-power`, `emdoor-charge`, or `emdoor-kbd` devices | DMI whitelist did not match (load with `force_load=1` to confirm) |
 | `EmdAcpi power mode bound (...) WMI path` | Healthy firmware, fast path |
 | `EmdAcpi power mode bound (...) EC IO fallback` | `WMBF` is broken; driver routed around it via `PWMD` |
+| `EmdAcpi battery charge ratio bound (...) EC IO fallback` | `WMDD` is broken; driver routed around it via EC MICP/MXCP registers |
 | `unsupported keyboard type 0xNN` | `KBTE` is not 2; this driver only supports the 4-zone layout |
 | `WMDA DTID=2 returned RTS0=N` | First-byte check failed; firmware returned an unexpected value (do not retry, the firmware is misbehaving) |
 

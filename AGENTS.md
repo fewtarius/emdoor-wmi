@@ -80,12 +80,14 @@ sudo ./test_zones.sh
          emd_power        emd_kbd
          (WMI driver)     (WMI driver)
              |                |
-             |                v
-             |        led-class-multicolor
+             |                +---> emdoor:multicolor:zone1..4, bar-left, bar-right
+             |                |     (led-class-multicolor, 6 zones)
              |                |
-             |                +-- 6 zones:
-             |                      4 keyboard regions (FACS bits 0-3)
-             |                      2 chassis side bars (FLAB bits 4-5)
+             |                +---> emdoor:rgb:mode
+             |                      (led-class control surface: mode/modes)
+             |                      Under /sys/class/leds/, picked up by
+             |                      SteamOS's 70-steam-jupiter-leds.rules
+             |                      which auto-chowns `mode` to deck:deck
              v
       platform_profile
              |
@@ -108,6 +110,12 @@ Two subsystems share a single source file but register as independent WMI driver
 
 Both use `PROBE_PREFER_ASYNCHRONOUS` and `no_singleton = true`. The module init function
 (`emd_wmi_init`) runs the DMI whitelist check before registering either driver.
+
+The keyboard driver registers seven LED class devices: six zone multicolor LEDs for RGB
+control, plus one virtual `emdoor:rgb:mode` LED class device that exists purely as a
+control surface for the firmware animation mode. Exposing `mode` under `/sys/class/leds/`
+makes SteamOS's `70-steam-jupiter-leds.rules` udev rule auto-chown the file to `deck:deck`,
+which is what Decky Loader (running as the deck user) needs to write animation modes.
 
 ---
 
@@ -258,9 +266,11 @@ unsupported hardware; if the firmware reports `KBTE != 2` the driver still refus
 
 1. Read the keyboard type via `WMDA` case 2 (DTID=2). Anything other than `KBTE=2` (4-zone)
    is rejected with `-ENODEV`.
-2. Register six multicolor LED class devices.
-3. Register the `type`, `mode`, and `modes` attributes.
-4. Do NOT apply an initial RGB state - leave hardware exactly as the firmware last had it.
+2. Register six multicolor LED class devices (one per zone).
+3. Register the `emdoor:rgb:mode` LED class control surface and attach the `mode` and
+   `modes` attributes to it via `device_create_file`.
+4. Register the `type` attribute on the WMI device.
+5. Do NOT apply an initial RGB state - leave hardware exactly as the firmware last had it.
 
 ---
 
@@ -338,7 +348,12 @@ Use `sysfs_emit`, not `snprintf`. Always include the trailing newline.
 static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
                          const char *buf, size_t count)
 {
-    struct emd_kbd_priv *priv = dev_get_drvdata(dev);
+    /*
+     * Mode lives on the emdoor:rgb:mode LED class device, whose
+     * parent is the WMI device. The WMI device's driver_data is
+     * our emd_kbd_priv; reach it via dev->parent->driver_data.
+     */
+    struct emd_kbd_priv *priv = dev_get_drvdata(dev->parent);
     u8 mode;
     int ret;
 
@@ -400,8 +415,7 @@ echo performance | sudo tee \
 cat /sys/bus/wmi/devices/4BCA6480-4D03-4674-84CB-26B4C8F5CFC2-10/platform-profile/platform-profile-0/profile
 
 # Keyboard mode
-echo always | sudo tee \
-    /sys/bus/wmi/devices/8600ACCE-FB9B-443E-86F4-3C867398AAE5-12/mode
+echo always | sudo tee /sys/class/leds/emdoor:rgb:mode/mode
 echo 255 0 0 | sudo tee \
     /sys/class/leds/emdoor:multicolor:zone1/multi_intensity
 ```
@@ -518,7 +532,7 @@ cat $PROFILE/profile
 echo performance | sudo tee $PROFILE/profile
 
 # Keyboard
-KBD=/sys/bus/wmi/devices/8600ACCE-FB9B-443E-86F4-3C867398AAE5-12
+KBD=/sys/class/leds/emdoor:rgb:mode
 cat $KBD/modes
 echo always | sudo tee $KBD/mode
 echo 255 0 0 | sudo tee /sys/class/leds/emdoor:multicolor:zone1/multi_intensity
