@@ -1,62 +1,51 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * EmdAcpi WMI driver for Nimo, Xuanpai, and MetaMech laptops
+ * EmdAcpi driver for Nimo, Xuanpai, and MetaMech laptops
  *
- * Supports the EmdAcpi power-mode, battery charge ratio, and six-zone
- * RGB keyboard WMI devices on the EmdAcpi firmware family. The driver
- * is restricted to three known products; see `emd_dmi_table` below.
- * Hardware owners with new products in this firmware family can submit
- * their DMI strings via a PR to extend the whitelist.
+ * Three subsystems in one module. Two are EC-backed platform drivers;
+ * one is a WMI driver for the keyboard (the only EmdAcpi method that
+ * parses cleanly under Linux ACPICA).
  *
- * 14 of the 15 EmdAcpi WMxx control methods declare a 63-bit
- * BufferField at offset 0x20 of an 8-byte buffer, which is structurally
- * out of bounds. Linux ACPICA rejects the declaration with
- * AE_AML_BUFFER_LIMIT before any case body runs so we route around
- * the broken methods:
+ *   - emdoor-power      platform device `emdoor-power`
+ *       platform_profile: low-power / balanced / performance (EC PWMD)
+ *       hwmon `emdoor_fan`:
+ *           fan1_input (RPM from EC FN1H/FN1L)
+ *           fan_mode   (custom: 1=AUTO, 2=MAX via EC TLID)
+ *           power[1-6]_cap (write-only, microWatts via EC CMS mailbox):
+ *             power1=PL1, power2=PL2, power3=PL3,
+ *             power4=PL1_DUP, power5=SYS_PL, power6=GPU_PL
+ *       On probe, sets fan TLID to EMD_FAN_AUTO so the EC defaults
+ *       to AUTO at boot regardless of what the firmware last had.
  *
- *   - WMBF (BF_POWER_MODE, platform_profile): the actual mode is held
- *     in the EC's PWMD field at OperationRegion offset 0x7C. The fan
- *     curve re-tuning that E004() does after `PWMD = ECPM` is skipped;
- *     platform_profile doesn't care about fan curves.
- *   - WMDA (DA_APP_KB_LED backend): parses cleanly with a
- *     0x50-byte local buffer. Use wmidev_evaluate_method() directly.
- *   - WMDD (BatteryChargeRatio): parses cleanly with 8-byte buffer.
+ *   - emdoor-charge     platform device `emdoor-charge`
+ *       power_supply extension on the existing BAT0:
+ *           charge_control_start_threshold  (read EC MICP)
+ *           charge_control_end_threshold    (read/write EC MXCP)
  *
- * Keyboard RGB protocol (BST2 via WMDA case 3):
+ *   - emdoor-kbd        WMI driver for 8600ACCE-FB9B-443E-86F4-3C867398AAE5
+ *       6 multicolor LED class devices (4 keyboard zones + 2 side bars)
+ *       mode control surface on `emdoor:rgb:mode` LED class device
  *
- * The keyboard has 6 logical zones:
- *   Zones 0-3: Keyboard zones (FACS bits 0-3 of FA00)
- *   Zones 4-5: Left/Right side bars (FLAB bits 4-5 of FA00)
+ * Why EC IO only for power and charge?
  *
- * Modes (FA06):
- *   0x00 (always)    - Static color per zone
- *   0x01-0x08        - Dynamic effects (twinkle, wave, breath, etc.)
- *   0xFE (off)       - All LEDs off
- *   0xFF (reset)     - Hardware reset
- *
- * Static mode (0x00): Each zone addressed individually with its own FA00
- * selector and RGB values. Effect byte = 0xFE (skip) tells EC to use
- * per-zone RGB without dynamic effect processing.
- *
- * Dynamic modes (0x01-0x08): Single FA00=0 with effect byte selects the
- * animation; zone colors come from the first zone's multicolor LED
- * brightness components.
- *
- * Side bars (zones 4,5): FLAB=0x10 (left) / 0x20 (right) / 0x30 (both).
- * These use the LLBR channel via ECMB=0x40. Writing RGB=0 with FLAB
- * is the only reliable way to turn off the side bars - FA04 brightness
- * alone does not persist across subsequent BST2 calls.
+ * 14 of the 15 EmdAcpi WMxx methods declare a 63-bit BufferField at
+ * offset 0x20 of an 8-byte argument buffer, which is structurally
+ * out-of-bounds. Linux ACPICA rejects the declaration with
+ * AE_AML_BUFFER_LIMIT before any case body runs and emits a kernel
+ * log error every probe; the unreferenced field is dead code. We
+ * cannot patch the BIOS or relax ACPICA. WMBF (power) and WMDD
+ * (charge) are both in this set, so we talk to the EC directly.
+ * WMDA uses a 0x50-byte local buffer and parses cleanly, so we keep
+ * the WMI driver for the keyboard.
  *
  * Copyright (C) 2026 fewtarius
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-/* Driver version for tracking installed module */
-#define EMD_DRIVER_VERSION "20260807.1"
-
 #include <linux/acpi.h>
-#include <linux/errno.h>
+#include <acpi/battery.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dmi.h>
 #include <linux/hwmon.h>
@@ -66,15 +55,13 @@
 #include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/platform_profile.h>
 #include <linux/power_supply.h>
 #include <linux/types.h>
 #include <linux/wmi.h>
 
-MODULE_VERSION(EMD_DRIVER_VERSION);
-MODULE_DESCRIPTION("EmdAcpi power, battery charge ratio, power limit override, and six-zone RGB driver (Nimo, Xuanpai, MetaMech)");
+MODULE_DESCRIPTION("EmdAcpi power, fan, charge, and six-zone RGB driver (Nimo, Xuanpai, MetaMech)");
 MODULE_AUTHOR("fewtarius");
 MODULE_LICENSE("GPL");
 
@@ -109,51 +96,125 @@ static int emd_dmi_check(void)
 	return -ENODEV;
 }
 
-/* Fan control constants */
-#define EMD_FAN_AUTO                  1
-#define EMD_FAN_MAX                   2
+/* ------------------------------------------------------------------------- */
+/* EC register map                                                            */
+/* ------------------------------------------------------------------------- */
 
 /*
- * Fan control via EC registers (from DSDT ECF2 OperationRegion):
- *   XXTT (0x30): Fan control command/data port. Write 0x11 to arm
- *                fan control before writing TLID.
- *   TLID (0x32): Fan mode parameter (1=auto, 2=max).
- *   FN1H (0x76): Fan 1 RPM high byte.
- *   FN1L (0x77): Fan 1 RPM low byte.
+ * All control goes through the embedded controller at I/O ports 0x62/0x66
+ * (the standard ACPI EC). The EC's OperationRegion exposes these fields:
  *
- * The WMAF WMI method is broken on Linux ACPICA (CreateField at
- * bit offset 0x20 with 0x3F width extends past the 8-byte buffer,
- * causing AE_AML_BUFFER_LIMIT), so we use direct EC I/O instead.
+ *   PWMD (0x7C)  Power mode (1=quiet, 2=balance, 3=performance)
+ *   TLID (0x32)  Fan mode (1=auto, 2=max)
+ *   XXTT (0x30)  Fan control arm (write 0x11 before TLID)
+ *   FN1H (0x76)  Fan 1 RPM high byte
+ *   FN1L (0x77)  Fan 1 RPM low byte
+ *   ECWR (0x78)  Power-limit refresh trigger (E004)
+ *   MICP (0xBB)  Min charge percent
+ *   MXCP (0xBC)  Max charge percent
  */
-#define EMD_EC_REG_XXTT              0x30
-#define EMD_EC_REG_TLID              0x32
-#define EMD_EC_REG_FN1H              0x76
-#define EMD_EC_REG_FN1L              0x77
+#define EMD_EC_REG_PWMD			0x7C
+#define EMD_EC_REG_TLID			0x32
+#define EMD_EC_REG_XXTT			0x30
+#define EMD_EC_REG_FN1H			0x76
+#define EMD_EC_REG_FN1L			0x77
+#define EMD_EC_REG_ECWR			0x78
+#define EMD_EC_REG_MICP			0xBB
+#define EMD_EC_REG_MXCP			0xBC
 
-static int emd_fan_get_speed(struct wmi_device *wdev, u16 *rpm)
+/* CMS mailbox for power-limit writes (I/O ports 0x72/0x73). */
+#define EMD_CMS_CMD_PORT		0x72
+#define EMD_CMS_DATA_PORT		0x73
+#define EMD_CMS_ALIB_CMD		0x0C
+
+/*
+ * Power limit register map (CMS mailbox ALIB cmd 0x0C):
+ *   0x05 = PL1     sustained power limit
+ *   0x06 = PL2     short turbo limit
+ *   0x07 = PL3     peak power limit
+ *   0x2E = PL1_DUP PL1 duplicate (some firmware mirrors PL1 here)
+ *   0x32 = SYS_PL  system total power limit
+ *   0x13 = GPU_PL  GPU power limit
+ *
+ * All values in milliwatts on the wire; hwmon exposes them as
+ * microWatts to match the kernel's powerN_cap convention.
+ */
+#define EMD_PL_REG_PL1			0x05
+#define EMD_PL_REG_PL2			0x06
+#define EMD_PL_REG_PL3			0x07
+#define EMD_PL_REG_PL1_DUP		0x2E
+#define EMD_PL_REG_SYS_PL		0x32
+#define EMD_PL_REG_GPU_PL		0x13
+
+/* Fan mode values (EC TLID register). */
+#define EMD_FAN_AUTO			1
+#define EMD_FAN_MAX			2
+
+/* Power profile values (EC PWMD register). */
+#define EMD_POWER_PROFILE_QUIET		1
+#define EMD_POWER_PROFILE_BALANCE	2
+#define EMD_POWER_PROFILE_PERF		3
+
+/* ------------------------------------------------------------------------- */
+/* EC IO helpers                                                              */
+/* ------------------------------------------------------------------------- */
+
+static int emd_ec_read(struct device *dev, u8 reg, u8 *val)
+{
+	int ret;
+
+	ret = ec_read(reg, val);
+	if (ret)
+		dev_err(dev, "EC read 0x%02x failed: %d\n", reg, ret);
+	return ret;
+}
+
+static int emd_ec_write(struct device *dev, u8 reg, u8 val)
+{
+	int ret;
+
+	ret = ec_write(reg, val);
+	if (ret)
+		dev_err(dev, "EC write 0x%02x=%02x failed: %d\n", reg, val, ret);
+	return ret;
+}
+
+static void emd_cms_write(u8 reg, u32 value)
+{
+	outb(EMD_CMS_ALIB_CMD, EMD_CMS_CMD_PORT);
+	udelay(1);
+	outb(reg, EMD_CMS_DATA_PORT);
+	udelay(1);
+	outl(value, EMD_CMS_DATA_PORT);
+	udelay(10);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Fan control (EC IO)                                                        */
+/* ------------------------------------------------------------------------- */
+
+static int emd_fan_get_speed(struct device *dev, u16 *rpm)
 {
 	u8 fn1l, fn1h;
 	int ret;
 
-	ret = ec_read(EMD_EC_REG_FN1L, &fn1l);
-	if (ret) {
-		dev_err(&wdev->dev, "EC read of FN1L (0x%02x) failed: %d\n",
-			EMD_EC_REG_FN1L, ret);
+	ret = emd_ec_read(dev, EMD_EC_REG_FN1L, &fn1l);
+	if (ret)
 		return ret;
-	}
-
-	ret = ec_read(EMD_EC_REG_FN1H, &fn1h);
-	if (ret) {
-		dev_err(&wdev->dev, "EC read of FN1H (0x%02x) failed: %d\n",
-			EMD_EC_REG_FN1H, ret);
+	ret = emd_ec_read(dev, EMD_EC_REG_FN1H, &fn1h);
+	if (ret)
 		return ret;
-	}
 
-	*rpm = (fn1h << 8) | fn1l;
+	*rpm = ((u16)fn1h << 8) | fn1l;
 	return 0;
 }
 
-static int emd_fan_set_mode(struct wmi_device *wdev, u8 mode)
+static int emd_fan_get_mode(struct device *dev, u8 *mode)
+{
+	return emd_ec_read(dev, EMD_EC_REG_TLID, mode);
+}
+
+static int emd_fan_set_mode(struct device *dev, u8 mode)
 {
 	u8 xxtt;
 	int ret;
@@ -161,40 +222,33 @@ static int emd_fan_set_mode(struct wmi_device *wdev, u8 mode)
 	if (mode != EMD_FAN_AUTO && mode != EMD_FAN_MAX)
 		return -EINVAL;
 
-	ret = ec_write(EMD_EC_REG_XXTT, 0x11);
-	if (ret) {
-		dev_err(&wdev->dev, "EC write of XXTT (0x%02x) failed: %d\n",
-			EMD_EC_REG_XXTT, ret);
+	/*
+	 * Arm fan control by writing 0x11 to XXTT, verify the EC echoed
+	 * it back, then write TLID and verify again. The EC is finicky
+	 * about the protocol: a missing arm write silently drops TLID.
+	 */
+	ret = emd_ec_write(dev, EMD_EC_REG_XXTT, 0x11);
+	if (ret)
 		return ret;
-	}
 
-	ret = ec_read(EMD_EC_REG_XXTT, &xxtt);
-	if (ret) {
-		dev_err(&wdev->dev, "EC read of XXTT (0x%02x) failed: %d\n",
-			EMD_EC_REG_XXTT, ret);
+	ret = emd_ec_read(dev, EMD_EC_REG_XXTT, &xxtt);
+	if (ret)
 		return ret;
-	}
 	if (xxtt != 0x11) {
-		dev_err(&wdev->dev, "XXTT verification failed: expected 0x11, got 0x%02x\n",
+		dev_err(dev, "XXTT arm verification failed: expected 0x11, got 0x%02x\n",
 			xxtt);
 		return -EIO;
 	}
 
-	ret = ec_write(EMD_EC_REG_TLID, mode);
-	if (ret) {
-		dev_err(&wdev->dev, "EC write of TLID (0x%02x) failed: %d\n",
-			EMD_EC_REG_TLID, ret);
+	ret = emd_ec_write(dev, EMD_EC_REG_TLID, mode);
+	if (ret)
 		return ret;
-	}
 
-	ret = ec_read(EMD_EC_REG_TLID, &xxtt);
-	if (ret) {
-		dev_err(&wdev->dev, "EC read of TLID (0x%02x) failed: %d\n",
-			EMD_EC_REG_TLID, ret);
+	ret = emd_ec_read(dev, EMD_EC_REG_TLID, &xxtt);
+	if (ret)
 		return ret;
-	}
 	if (xxtt != mode) {
-		dev_err(&wdev->dev, "TLID verification failed: expected %d, got 0x%02x\n",
+		dev_err(dev, "TLID verification failed: expected %u, got 0x%02x\n",
 			mode, xxtt);
 		return -EIO;
 	}
@@ -202,305 +256,31 @@ static int emd_fan_set_mode(struct wmi_device *wdev, u8 mode)
 	return 0;
 }
 
-/* Fan control sysfs attributes */
-static ssize_t fan_speed_show(struct device *dev,
-			      struct device_attribute *attr,
-			      char *buf)
-{
-	struct wmi_device *wdev = to_wmi_device(dev);
-	u16 rpm;
-	int ret;
-
-	ret = emd_fan_get_speed(wdev, &rpm);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", rpm);
-}
-
-static ssize_t fan_mode_show(struct device *dev,
-			     struct device_attribute *attr,
-			     char *buf)
-{
-	u8 mode;
-	int ret;
-
-	ret = ec_read(EMD_EC_REG_TLID, &mode);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", mode);
-}
-
-static ssize_t fan_mode_store(struct device *dev,
-			      struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	struct wmi_device *wdev = to_wmi_device(dev);
-	unsigned long mode;
-	int ret;
-
-	if (kstrtoul(buf, 0, &mode) || (mode != 1 && mode != 2))
-		return -EINVAL;
-
-	ret = emd_fan_set_mode(wdev, (u8)mode);
-	if (ret)
-		return ret;
-
-	return count;
-}
-
-static DEVICE_ATTR_RO(fan_speed);
-static DEVICE_ATTR_RW(fan_mode);
-
-#define EMD_GUID_BF_POWER_MODE        "4BCA6480-4D03-4674-84CB-26B4C8F5CFC2"
-#define EMD_GUID_DA_APP_KB_LED        "8600ACCE-FB9B-443E-86F4-3C867398AAE5"
-#define EMD_GUID_BATTERY_CHARGE       "6B40A935-7FEF-42B6-B08D-6C79B57D6C35"
-#define EMD_GUID_FAN_CONTROL          "D06385DE-BC53-4B9B-85DC-674936D9549F"
-
 /* ------------------------------------------------------------------------- */
-/* Shared helpers                                                            */
+/* Power platform driver                                                      */
 /* ------------------------------------------------------------------------- */
-
-static int emd_wmi_call(struct wmi_device *wdev, u8 sub,
-			const void *in, size_t in_len,
-			void *out, size_t out_size)
-{
-	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
-	struct acpi_buffer in_buf = { in_len, (void *)in };
-	acpi_status status;
-	union acpi_object *obj;
-	int ret = 0;
-
-	if (in_len && !in)
-		return -EINVAL;
-
-	status = wmidev_evaluate_method(wdev, 0, sub, &in_buf, &result);
-	if (ACPI_FAILURE(status)) {
-		if (status == AE_AML_BUFFER_LIMIT)
-			ret = -EBUSY;
-		else
-			ret = -EIO;
-		dev_dbg(&wdev->dev, "WMI method 0x%02x: %s\n", sub,
-			acpi_format_exception(status));
-		kfree(result.pointer);
-		return ret;
-	}
-
-	if (out && out_size) {
-		obj = result.pointer;
-		if (!obj || obj->type != ACPI_TYPE_BUFFER ||
-		    obj->buffer.length < out_size) {
-			ret = -EIO;
-			goto free;
-		}
-		memcpy(out, obj->buffer.pointer, out_size);
-	}
-
-free:
-	kfree(result.pointer);
-	return ret;
-}
-
-/* Standard 8-byte return layout used by most EmdAcpi methods */
-struct emd_return {
-	u16 rt_code;
-	u16 value;
-	u8  reserved[4];
-} __packed;
-
-#define EMD_RT_OK	0
-
-/* ------------------------------------------------------------------------- */
-/* Power mode (BF -> WMBF, with EC IO fallback for the broken BIOS)         */
-/* ------------------------------------------------------------------------- */
-
-/*
- * EC register map for power mode:
- *   PWMD (0x7C): Current power mode (1=quiet, 2=balance, 3=perf)
- *   ECWR (0x78): EC write register - writing triggers E4 (power mode change)
- * Battery Charge Ratio registers (shared EC OperationRegion):
- *   MICP (0xBB): Min charge percent
- *   MXCP (0xBC): Max charge percent
- */
-
-#define EMD_POWER_PROFILE_PERF		3
-#define EMD_POWER_PROFILE_BALANCE	2
-#define EMD_POWER_PROFILE_QUIET		1
-#define EMD_POWER_PROFILE_READ		4
-
-#define EMD_EC_REG_PWMD			0x7C
-#define EMD_EC_REG_MICP			0xBB
-#define EMD_EC_REG_MXCP			0xBC
-#define EMD_EC_REG_ECWR			0x78
 
 struct emd_power_priv {
-	struct wmi_device *wdev;
-	bool quirk_broken_wmbf;
+	struct device *dev;
 	struct device *hwmon_dev;
+	struct device *profile_dev;
 };
 
 /*
- * Hwmon-compatible fan control attributes.
- * Exposes fan1_input (RPM) and fan_mode via /sys/class/hwmon/ so that
- * lm-sensors, fancontrol, and other standard tools can access them.
+ * platform_profile handlers.
+ *
+ * Reads/writes the EC PWMD register directly. The EC firmware watches
+ * this register and re-tunes PL1/PL2/PL3 limits when it changes; we
+ * additionally pulse ECWR (0x78) so any manual PL overrides via the
+ * CMS mailbox take effect immediately.
  */
-static ssize_t hwmon_fan1_input_show(struct device *dev,
-				     struct device_attribute *attr, char *buf)
-{
-	struct emd_power_priv *priv = dev_get_drvdata(dev);
-	u16 rpm;
-	int ret;
-
-	ret = emd_fan_get_speed(priv->wdev, &rpm);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", rpm);
-}
-
-static ssize_t hwmon_fan_mode_show(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	u8 mode;
-	int ret;
-
-	ret = ec_read(EMD_EC_REG_TLID, &mode);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", mode);
-}
-
-static ssize_t hwmon_fan_mode_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct emd_power_priv *priv = dev_get_drvdata(dev);
-	unsigned long mode;
-	int ret;
-
-	ret = kstrtoul(buf, 0, &mode);
-	if (ret)
-		return ret;
-	if (mode != EMD_FAN_AUTO && mode != EMD_FAN_MAX)
-		return -EINVAL;
-
-	ret = emd_fan_set_mode(priv->wdev, (u8)mode);
-	return ret ?: count;
-}
-
-static struct device_attribute dev_attr_fan1_input =
-	__ATTR(fan1_input, 0444, hwmon_fan1_input_show, NULL);
-static struct device_attribute dev_attr_fan_mode_hwmon =
-	__ATTR(fan_mode, 0644, hwmon_fan_mode_show, hwmon_fan_mode_store);
-
-static int emd_ec_pwmd_read(struct emd_power_priv *priv, u8 *val)
-{
-	int ret;
-
-	ret = ec_read(EMD_EC_REG_PWMD, val);
-	if (ret)
-		dev_err(&priv->wdev->dev,
-			"EC read of PWMD (0x7C) failed: %d\n", ret);
-	return ret;
-}
-
-static int emd_ec_pwmd_write(struct emd_power_priv *priv, u8 val)
-{
-	/*
-	 * Write power mode to EC PWMD register (0x7C). The EC firmware
-	 * monitors this register and applies the corresponding fan curve
-	 * and power limits when it changes.
-	 */
-	int ret;
-
-	ret = ec_write(EMD_EC_REG_PWMD, val);
-	if (ret)
-		dev_err(&priv->wdev->dev,
-			"EC write of PWMD (0x7C) failed: %d\n", ret);
-	return ret;
-}
-
-static int emd_ec_ecwr_write(struct emd_power_priv *priv, u8 val)
-{
-	/*
-	 * Write to ECWR (0x78) to trigger the E4 interrupt handler in
-	 * the EC firmware. This forces the EC to re-evaluate power mode
-	 * and re-apply the corresponding PL1/PL2/PL3 limits. The value
-	 * written is not used by the EC - any non-zero write triggers E4.
-	 */
-	int ret;
-
-	ret = ec_write(EMD_EC_REG_ECWR, val);
-	if (ret)
-		dev_err(&priv->wdev->dev,
-			"EC write of ECWR (0x78) failed: %d\n", ret);
-	return ret;
-}
-
-static int emd_power_set(struct emd_power_priv *priv, int profile)
-{
-	struct emd_return r;
-	int ret;
-
-	if (profile != EMD_POWER_PROFILE_PERF &&
-	    profile != EMD_POWER_PROFILE_BALANCE &&
-	    profile != EMD_POWER_PROFILE_QUIET)
-		return -EINVAL;
-
-	/*
-	 * Try WMI path first. If the BIOS WMBF method is broken (AE_AML_BUFFER_LIMIT
-	 * from the out-of-bounds BufferField), fall back to EC IO.
-	 */
-	if (priv->quirk_broken_wmbf)
-		return emd_ec_pwmd_write(priv, (u8)profile);
-
-	ret = emd_wmi_call(priv->wdev, (u8)profile, NULL, 0, &r, sizeof(r));
-	if (ret == 0 && r.rt_code == EMD_RT_OK)
-		return 0;
-
-	priv->quirk_broken_wmbf = true;
-	return emd_ec_pwmd_write(priv, (u8)profile);
-}
-
-static int emd_power_get(struct emd_power_priv *priv, int *profile)
-{
-	struct emd_return r;
-	u8 val;
-	int ret;
-
-	/*
-	 * Read current power mode. Try WMI first, fall back to EC PWMD
-	 * register on failure.
-	 */
-
-	if (priv->quirk_broken_wmbf)
-		goto read_ec;
-
-	ret = emd_wmi_call(priv->wdev, EMD_POWER_PROFILE_READ, NULL, 0,
-			   &r, sizeof(r));
-	if (ret == 0 && r.rt_code == EMD_RT_OK) {
-		*profile = r.value;
-		return 0;
-	}
-
-	priv->quirk_broken_wmbf = true;
-read_ec:
-	ret = emd_ec_pwmd_read(priv, &val);
-	if (ret)
-		return ret;
-	*profile = val;
-	return 0;
-}
-
 static int emd_power_profile_get(struct device *dev,
 				 enum platform_profile_option *profile)
 {
-	struct emd_power_priv *priv = dev_get_drvdata(dev);
-	int val, ret;
+	u8 val;
+	int ret;
 
-	ret = emd_power_get(priv, &val);
+	ret = emd_ec_read(dev, EMD_EC_REG_PWMD, &val);
 	if (ret)
 		return ret;
 
@@ -515,7 +295,7 @@ static int emd_power_profile_get(struct device *dev,
 		*profile = PLATFORM_PROFILE_LOW_POWER;
 		break;
 	default:
-		dev_warn(dev, "unknown power-mode value %d\n", val);
+		dev_warn(dev, "unknown power-mode value %u\n", val);
 		return -EINVAL;
 	}
 	return 0;
@@ -524,18 +304,29 @@ static int emd_power_profile_get(struct device *dev,
 static int emd_power_profile_set(struct device *dev,
 				 enum platform_profile_option profile)
 {
-	struct emd_power_priv *priv = dev_get_drvdata(dev);
+	u8 val;
+	int ret;
 
 	switch (profile) {
 	case PLATFORM_PROFILE_LOW_POWER:
-		return emd_power_set(priv, EMD_POWER_PROFILE_QUIET);
+		val = EMD_POWER_PROFILE_QUIET;
+		break;
 	case PLATFORM_PROFILE_BALANCED:
-		return emd_power_set(priv, EMD_POWER_PROFILE_BALANCE);
+		val = EMD_POWER_PROFILE_BALANCE;
+		break;
 	case PLATFORM_PROFILE_PERFORMANCE:
-		return emd_power_set(priv, EMD_POWER_PROFILE_PERF);
+		val = EMD_POWER_PROFILE_PERF;
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
+
+	ret = emd_ec_write(dev, EMD_EC_REG_PWMD, val);
+	if (ret)
+		return ret;
+
+	/* Trigger EC E4 interrupt so PL1/PL2/PL3 are re-tuned. */
+	return emd_ec_write(dev, EMD_EC_REG_ECWR, 1);
 }
 
 static int emd_power_profile_probe(void *drvdata, unsigned long *choices)
@@ -552,545 +343,450 @@ static const struct platform_profile_ops emd_power_profile_ops = {
 	.profile_set = emd_power_profile_set,
 };
 
-/*
- * ECWR sysfs attribute - write-only trigger for E4 interrupt.
- * Writing any value forces EC to re-apply power limits for current mode.
- * Used for debugging and manual limit refresh.
- */
-static ssize_t ecwr_store(struct device *dev,
-			  struct device_attribute *attr,
-			  const char *buf, size_t count)
+/* hwmon callbacks */
+
+static umode_t emd_hwmon_is_visible(const void *drvdata,
+				    enum hwmon_sensor_types type,
+				    u32 attr, int channel)
 {
-	struct emd_power_priv *priv = dev_get_drvdata(dev);
-	unsigned long val;
-	int ret;
-
-	ret = kstrtoul(buf, 0, &val);
-	if (ret)
-		return ret;
-	if (val > 0xFF)
-		return -EINVAL;
-
-	ret = emd_ec_ecwr_write(priv, (u8)val);
-	return ret ?: count;
+	switch (type) {
+	case hwmon_fan:
+		switch (attr) {
+		case hwmon_fan_input:
+			return 0444;
+		default:
+			return 0;
+		}
+	case hwmon_power:
+		switch (attr) {
+		case hwmon_power_cap:
+			return 0200;	/* write-only */
+		default:
+			return 0;
+		}
+	default:
+		return 0;
+	}
 }
 
-static DEVICE_ATTR_WO(ecwr);
+static int emd_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+			  u32 attr, int channel, long *val)
+{
+	if (type == hwmon_fan && attr == hwmon_fan_input) {
+		u16 rpm;
+		int ret;
 
-static int emd_power_probe(struct wmi_device *wdev, const void *context)
+		ret = emd_fan_get_speed(dev, &rpm);
+		if (ret)
+			return ret;
+		*val = rpm;
+		return 0;
+	}
+	return -EOPNOTSUPP;
+}
+
+static int emd_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
+			   u32 attr, int channel, long val)
+{
+	static const u8 pl_regs[] = {
+		[0] = EMD_PL_REG_PL1,
+		[1] = EMD_PL_REG_PL2,
+		[2] = EMD_PL_REG_PL3,
+		[3] = EMD_PL_REG_PL1_DUP,
+		[4] = EMD_PL_REG_SYS_PL,
+		[5] = EMD_PL_REG_GPU_PL,
+	};
+
+	if (type == hwmon_power && attr == hwmon_power_cap) {
+		/* hwmon is microWatts; CMS mailbox is milliwatts. */
+		if (val < 0 || val > (long)(UINT_MAX / 1000) * 1000)
+			return -EINVAL;
+		if (channel < 0 || channel >= ARRAY_SIZE(pl_regs))
+			return -EINVAL;
+		emd_cms_write(pl_regs[channel], (u32)(val / 1000));
+		return 0;
+	}
+	return -EOPNOTSUPP;
+}
+
+static const struct hwmon_ops emd_hwmon_ops = {
+	.is_visible = emd_hwmon_is_visible,
+	.read = emd_hwmon_read,
+	.write = emd_hwmon_write,
+};
+
+static const u32 emd_hwmon_fan_config[] = {
+	HWMON_F_INPUT,
+	0,
+};
+
+static const struct hwmon_channel_info emd_hwmon_fan_info = {
+	.type = hwmon_fan,
+	.config = emd_hwmon_fan_config,
+};
+
+static const u32 emd_hwmon_power_config[] = {
+	HWMON_P_CAP,	/* power1 PL1 */
+	HWMON_P_CAP,	/* power2 PL2 */
+	HWMON_P_CAP,	/* power3 PL3 */
+	HWMON_P_CAP,	/* power4 PL1_DUP */
+	HWMON_P_CAP,	/* power5 SYS_PL */
+	HWMON_P_CAP,	/* power6 GPU_PL */
+	0,
+};
+
+static const struct hwmon_channel_info emd_hwmon_power_info = {
+	.type = hwmon_power,
+	.config = emd_hwmon_power_config,
+};
+
+static const struct hwmon_channel_info * const emd_hwmon_info[] = {
+	&emd_hwmon_fan_info,
+	&emd_hwmon_power_info,
+	NULL,
+};
+
+static const struct hwmon_chip_info emd_hwmon_chip_info = {
+	.ops = &emd_hwmon_ops,
+	.info = emd_hwmon_info,
+};
+
+/*
+ * Custom hwmon attribute: fan_mode (1=AUTO, 2=MAX).
+ *
+ * Not a standard hwmon attribute - the kernel's hwmon class does not
+ * define a "fan mode" attribute, only fan_enable (0/1 toggle) and
+ * pwm_enable (0=off, 1=manual, 2=auto, ...). EmdAcpi firmware only
+ * exposes two meaningful states, and neither maps cleanly to those
+ * standard attributes, so we keep the firmware's encoding verbatim.
+ * The attribute lives on the hwmon device so userspace still finds
+ * it at /sys/class/hwmon/hwmonN/fan_mode.
+ */
+static ssize_t fan_mode_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	u8 mode;
+	int ret;
+
+	ret = emd_fan_get_mode(dev, &mode);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u\n", mode);
+}
+
+static ssize_t fan_mode_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	unsigned long mode;
+	int ret;
+
+	ret = kstrtoul(buf, 0, &mode);
+	if (ret)
+		return ret;
+
+	ret = emd_fan_set_mode(dev, (u8)mode);
+	return ret ?: count;
+}
+static DEVICE_ATTR_RW(fan_mode);
+
+static struct attribute *emd_hwmon_custom_attrs[] = {
+	&dev_attr_fan_mode.attr,
+	NULL,
+};
+
+static const struct attribute_group emd_hwmon_custom_group = {
+	.attrs = emd_hwmon_custom_attrs,
+};
+
+static const struct attribute_group *emd_hwmon_extra_groups[] = {
+	&emd_hwmon_custom_group,
+	NULL,
+};
+
+static int emd_power_probe(struct platform_device *pdev)
 {
 	struct emd_power_priv *priv;
-	struct device *ppdev;
-	int probe_val, ret;
-
-	priv = devm_kzalloc(&wdev->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	priv->wdev = wdev;
-	dev_set_drvdata(&wdev->dev, priv);
-
-	ret = emd_power_get(priv, &probe_val);
-	if (ret)
-		return ret;
-
-	ppdev = devm_platform_profile_register(&wdev->dev, "epm",
-					       priv, &emd_power_profile_ops);
-	if (IS_ERR(ppdev))
-		return PTR_ERR(ppdev);
-
-	/* Add ECWR control attribute */
-	ret = device_create_file(&wdev->dev, &dev_attr_ecwr);
-	if (ret)
-		return ret;
-
-	/* Add fan control attributes */
-	ret = device_create_file(&wdev->dev, &dev_attr_fan_speed);
-	if (ret)
-		dev_warn(&wdev->dev, "failed to create fan_speed attr: %d\n", ret);
-	ret = device_create_file(&wdev->dev, &dev_attr_fan_mode);
-	if (ret)
-		dev_warn(&wdev->dev, "failed to create fan_mode attr: %d\n", ret);
-
-	/* Register hwmon device for standard tool access (/sys/class/hwmon/) */
-	priv->hwmon_dev = devm_hwmon_device_register_with_info(&wdev->dev,
-				"emdoor_fan", priv, NULL, NULL);
-	if (IS_ERR(priv->hwmon_dev)) {
-		ret = PTR_ERR(priv->hwmon_dev);
-		dev_warn(&wdev->dev, "failed to register hwmon device: %d\n", ret);
-		priv->hwmon_dev = NULL;
-	} else {
-		ret = device_create_file(priv->hwmon_dev, &dev_attr_fan1_input);
-		if (ret)
-			dev_warn(&wdev->dev, "failed to create fan1_input attr: %d\n", ret);
-		ret = device_create_file(priv->hwmon_dev, &dev_attr_fan_mode_hwmon);
-		if (ret)
-			dev_warn(&wdev->dev, "failed to create fan_mode hwmon attr: %d\n", ret);
-	}
-
-	dev_info(&wdev->dev,
-		 "EmdAcpi power mode bound (current=%d, %s)\n",
-		 probe_val,
-		 priv->quirk_broken_wmbf ? "EC IO fallback" : "WMI path");
-	return 0;
-}
-
-static void emd_power_remove(struct wmi_device *wdev)
-{
-	struct emd_power_priv *priv = dev_get_drvdata(&wdev->dev);
-
-	device_remove_file(&wdev->dev, &dev_attr_ecwr);
-	device_remove_file(&wdev->dev, &dev_attr_fan_speed);
-	device_remove_file(&wdev->dev, &dev_attr_fan_mode);
-	if (priv->hwmon_dev) {
-		device_remove_file(priv->hwmon_dev, &dev_attr_fan1_input);
-		device_remove_file(priv->hwmon_dev, &dev_attr_fan_mode_hwmon);
-	}
-}
-
-static const struct wmi_device_id emd_power_id_table[] = {
-	{ EMD_GUID_BF_POWER_MODE, 0 },
-	{ }
-};
-
-static struct wmi_driver emd_power_driver = {
-	.driver = {
-		.name = "emdoor-power",
-		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
-	},
-	.id_table = emd_power_id_table,
-	.probe = emd_power_probe,
-	.remove = emd_power_remove,
-	.no_singleton = true,
-};
-
-/* ------------------------------------------------------------------------- */
-/* Battery Charge Ratio (WMDD -> EmdAcpi_BatteryChargeRatio)                */
-/* ------------------------------------------------------------------------- */
-
-#define EMD_WMDD_CASE_GET		0x01
-#define EMD_WMDD_CASE_SET		0x02
-
-/*
- * Standard 8-byte return layout used by EmdAcpi WMDD (BatteryChargeRatio)
- */
-struct emd_charge_return {
-	u16 rt_code;
-	u8  micp;
-	u8  mxcp;
-	u8  reserved[3];
-} __packed;
-
-struct emd_charge_priv {
-	struct wmi_device *wdev;
-	struct mutex lock;
-	bool quirk_broken_wmdd;
-};
-
-/*
- * EC register access helpers for charge ratio
- */
-static int emd_ec_micp_read(struct emd_charge_priv *priv, u8 *val)
-{
-	int ret;
-
-	ret = ec_read(EMD_EC_REG_MICP, val);
-	if (ret)
-		dev_err(&priv->wdev->dev,
-			"EC read of MICP (0xBB) failed: %d\n", ret);
-	return ret;
-}
-
-static int emd_ec_mxcp_read(struct emd_charge_priv *priv, u8 *val)
-{
-	int ret;
-
-	ret = ec_read(EMD_EC_REG_MXCP, val);
-	if (ret)
-		dev_err(&priv->wdev->dev,
-			"EC read of MXCP (0xBC) failed: %d\n", ret);
-	return ret;
-}
-
-static int emd_ec_micp_write(struct emd_charge_priv *priv, u8 val)
-{
-	int ret;
-
-	ret = ec_write(EMD_EC_REG_MICP, val);
-	if (ret)
-		dev_err(&priv->wdev->dev,
-			"EC write of MICP (0xBB) failed: %d\n", ret);
-	return ret;
-}
-
-static int emd_ec_mxcp_write(struct emd_charge_priv *priv, u8 val)
-{
-	int ret;
-
-	ret = ec_write(EMD_EC_REG_MXCP, val);
-	if (ret)
-		dev_err(&priv->wdev->dev,
-			"EC write of MXCP (0xBC) failed: %d\n", ret);
-	return ret;
-}
-
-/*
- * Read charge ratio: try WMI first, fall back to EC on failure.
- * Per DSDT: WMDD case 1 returns MICP and MXCP.
- */
-static int emd_charge_get(struct emd_charge_priv *priv, u8 *micp, u8 *mxcp)
-{
-	struct emd_charge_return r;
-	int ret;
-
-	if (priv->quirk_broken_wmdd)
-		goto read_ec;
-
-	ret = emd_wmi_call(priv->wdev, EMD_WMDD_CASE_GET, NULL, 0, &r, sizeof(r));
-	if (ret == 0 && r.rt_code == EMD_RT_OK) {
-		*micp = r.micp;
-		*mxcp = r.mxcp;
-		return 0;
-	}
-
-	priv->quirk_broken_wmdd = true;
-read_ec:
-	ret = emd_ec_micp_read(priv, micp);
-	if (ret)
-		return ret;
-	ret = emd_ec_mxcp_read(priv, mxcp);
-	if (ret)
-		return ret;
-	return 0;
-}
-
-/*
- * Write charge ratio: try WMI first, fall back to EC on failure.
- * Per DSDT: WMDD case 2 writes Arg2 to MXCP and Arg2-1 to MICP.
- * Our charge_ratio attribute takes one value (0-100) and applies:
- *   MXCP = val, MICP = val - 1
- */
-static int emd_charge_set(struct emd_charge_priv *priv, u8 val)
-{
-	struct emd_return r;
-	u8 micp, mxcp;
-	int ret;
-
-	if (val > 100)
-		return -EINVAL;
-
-	mxcp = val;
-	micp = (val > 0) ? val - 1 : 0;
-
-	if (priv->quirk_broken_wmdd)
-		goto write_ec;
-
-	/* WMDD case 2 takes Arg2 (MXCP); MICP = Arg2-1 per DSDT */
-	ret = emd_wmi_call(priv->wdev, EMD_WMDD_CASE_SET, &mxcp, 1, &r, sizeof(r));
-	if (ret == 0 && r.rt_code == EMD_RT_OK)
-		return 0;
-
-	priv->quirk_broken_wmdd = true;
-write_ec:
-	ret = emd_ec_mxcp_write(priv, mxcp);
-	if (ret)
-		return ret;
-	ret = emd_ec_micp_write(priv, micp);
-	return ret;
-}
-
-/*
- * sysfs attributes for charge ratio on the WMI device:
- *   charge_micp  - read current MICP (min charge %)
- *   charge_mxcp  - read current MXCP (max charge %)
- *   charge_ratio - write new limit (sets MXCP=val, MICP=val-1)
- */
-static ssize_t charge_micp_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct emd_charge_priv *priv = dev_get_drvdata(dev);
-	u8 micp, mxcp;
-	int ret;
-
-	ret = mutex_lock_interruptible(&priv->lock);
-	if (ret)
-		return ret;
-	ret = emd_charge_get(priv, &micp, &mxcp);
-	mutex_unlock(&priv->lock);
-
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", micp);
-}
-static DEVICE_ATTR_RO(charge_micp);
-
-static ssize_t charge_mxcp_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct emd_charge_priv *priv = dev_get_drvdata(dev);
-	u8 micp, mxcp;
-	int ret;
-
-	ret = mutex_lock_interruptible(&priv->lock);
-	if (ret)
-		return ret;
-	ret = emd_charge_get(priv, &micp, &mxcp);
-	mutex_unlock(&priv->lock);
-
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", mxcp);
-}
-static DEVICE_ATTR_RO(charge_mxcp);
-
-static ssize_t charge_ratio_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
-{
-	struct emd_charge_priv *priv = dev_get_drvdata(dev);
-	unsigned long val;
-	int ret;
-
-	ret = kstrtoul(buf, 0, &val);
-	if (ret)
-		return ret;
-	if (val > 100)
-		return -EINVAL;
-
-	ret = mutex_lock_interruptible(&priv->lock);
-	if (ret)
-		return ret;
-	ret = emd_charge_set(priv, (u8)val);
-	mutex_unlock(&priv->lock);
-
-	return ret ?: count;
-}
-static DEVICE_ATTR_WO(charge_ratio);
-
-static struct attribute *emd_charge_attrs[] = {
-	&dev_attr_charge_micp.attr,
-	&dev_attr_charge_mxcp.attr,
-	&dev_attr_charge_ratio.attr,
-	NULL,
-};
-
-static const struct attribute_group emd_charge_attr_group = {
-	.attrs = emd_charge_attrs,
-};
-
-static int emd_charge_probe(struct wmi_device *wdev, const void *context)
-{
-	struct emd_charge_priv *priv;
-	u8 micp, mxcp;
-	int ret;
-
-	priv = devm_kzalloc(&wdev->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	priv->wdev = wdev;
-	mutex_init(&priv->lock);
-	dev_set_drvdata(&wdev->dev, priv);
-
-	ret = emd_charge_get(priv, &micp, &mxcp);
-	if (ret)
-		return ret;
-
-	ret = devm_device_add_group(&wdev->dev, &emd_charge_attr_group);
-	if (ret)
-		return ret;
-
-	dev_info(&wdev->dev,
-		 "EmdAcpi battery charge ratio bound (MICP=%u, MXCP=%u, %s)\n",
-		 micp, mxcp,
-		 priv->quirk_broken_wmdd ? "EC IO fallback" : "WMI path");
-	return 0;
-}
-
-static void emd_charge_remove(struct wmi_device *wdev)
-{
-	/* devm_device_add_group auto-removes on detach */
-}
-
-static const struct wmi_device_id emd_charge_id_table[] = {
-	{ EMD_GUID_BATTERY_CHARGE, 0 },
-	{ }
-};
-
-static struct wmi_driver emd_charge_driver = {
-	.driver = {
-		.name = "emdoor-charge",
-		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
-	},
-	.id_table = emd_charge_id_table,
-	.probe = emd_charge_probe,
-	.remove = emd_charge_remove,
-	.no_singleton = true,
-};
-
-/* ------------------------------------------------------------------------- */
-/* Power Limit Override (CMS mailbox direct access)                         */
-/* ------------------------------------------------------------------------- */
-
-/*
- * Power Limit Override (CMS mailbox direct access)
- *
- * The EC exposes a Command/Data mailbox at I/O ports 0x72/0x73.
- * Command 0x0C (ALIB) writes a 32-bit value to a specific register:
- *   outb(0x0C, 0x72) -> outb(reg, 0x73) -> outl(value, 0x73)
- * Register map:
- *   0x05 = PL1 (sustained power limit)
- *   0x06 = PL2 (short turbo limit)
- *   0x07 = PL3 (peak power limit)
- *   0x2E = PL1 duplicate (some firmware mirrors PL1 here)
- *   0x32 = SYS_PL (system total power limit)
- *   0x13 = GPU_PL (GPU power limit)
- * All values in milliwatts. Write-only sysfs interface.
- */
-#define EMD_CMS_CMD_PORT		0x72
-#define EMD_CMS_DATA_PORT		0x73
-#define EMD_CMS_ALIB_CMD		0x0C
-
-#define EMD_PL_REG_PL1		0x05
-#define EMD_PL_REG_PL2		0x06
-#define EMD_PL_REG_PL3		0x07
-#define EMD_PL_REG_PL1_DUP	0x2E
-#define EMD_PL_REG_SYS		0x32
-#define EMD_PL_REG_GPU		0x13
-
-struct emd_pl_priv {
-	struct mutex lock;
-};
-
-/*
- * EC CMS mailbox write helper.
- * Sequence: cmd -> delay -> reg -> delay -> value -> delay
- * Delays are critical - the EC needs time to process each byte.
- */
-static int emd_cms_write(u8 cmd, u8 reg, u32 value)
-{
-	outb(cmd, EMD_CMS_CMD_PORT);
-	udelay(1);
-	outb(reg, EMD_CMS_DATA_PORT);
-	udelay(1);
-	outl(value, EMD_CMS_DATA_PORT);
-	udelay(10);
-	return 0;
-}
-
-static ssize_t pl_limit_show(struct kobject *kobj,
-			     struct kobj_attribute *attr, char *buf)
-{
-	/*
-	 * Power limit sysfs entries are write-only. Reads return this
-	 * static string indicating units (milliwatts).
-	 */
-	return sysfs_emit(buf, "write-only (mW)\n");
-}
-
-#define EMD_PL_ATTR(name, reg)						\
-	static ssize_t emd_pl_##name##_store(struct kobject *kobj,	\
-					     struct kobj_attribute *attr,	\
-					     const char *buf, size_t count)	\
-	{								\
-		struct emd_pl_priv *priv = dev_get_drvdata(kobj_to_dev(kobj));	\
-		unsigned long val;					\
-		int ret;						\
-									\
-		if (!priv)						\
-			return -ENODEV;					\
-		ret = kstrtoul(buf, 0, &val);				\
-		if (ret)						\
-			return ret;					\
-		if (val > 0xFFFFFFFF)					\
-			return -EINVAL;					\
-		ret = mutex_lock_interruptible(&priv->lock);		\
-		if (ret)						\
-			return ret;					\
-		ret = emd_cms_write(EMD_CMS_ALIB_CMD, reg, (u32)val);	\
-		mutex_unlock(&priv->lock);				\
-		return ret ?: count;					\
-	}								\
-	static struct kobj_attribute emd_pl_##name =			\
-		__ATTR(name, 0644, pl_limit_show, emd_pl_##name##_store)
-
-EMD_PL_ATTR(pl1, EMD_PL_REG_PL1);
-EMD_PL_ATTR(pl2, EMD_PL_REG_PL2);
-EMD_PL_ATTR(pl3, EMD_PL_REG_PL3);
-EMD_PL_ATTR(pl1_dup, EMD_PL_REG_PL1_DUP);
-EMD_PL_ATTR(sys_pl, EMD_PL_REG_SYS);
-EMD_PL_ATTR(gpu_pl, EMD_PL_REG_GPU);
-
-static struct attribute *emd_pl_attrs[] = {
-	&emd_pl_pl1.attr,
-	&emd_pl_pl2.attr,
-	&emd_pl_pl3.attr,
-	&emd_pl_pl1_dup.attr,
-	&emd_pl_sys_pl.attr,
-	&emd_pl_gpu_pl.attr,
-	NULL,
-};
-
-static const struct attribute_group emd_pl_attr_group = {
-	.attrs = emd_pl_attrs,
-	.name = "power_limits",
-};
-
-static int emd_pl_probe(struct platform_device *pdev)
-{
-	struct emd_pl_priv *priv;
+	u8 probe_val;
 	int ret;
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	priv->dev = &pdev->dev;
+	dev_set_drvdata(&pdev->dev, priv);
 
-	mutex_init(&priv->lock);
-	platform_set_drvdata(pdev, priv);
-
-	ret = sysfs_create_group(&pdev->dev.kobj, &emd_pl_attr_group);
+	/* Read initial power mode for the boot log. */
+	ret = emd_ec_read(&pdev->dev, EMD_EC_REG_PWMD, &probe_val);
 	if (ret)
 		return ret;
 
-	dev_info(&pdev->dev, "EmdAcpi power limit override interface ready\n");
+	/*
+	 * Set fan to AUTO on probe. The EC's fan-control register is
+	 * undefined on first power-on and is left at whatever the BIOS
+	 * set during boot, which the firmware defaults to MAX. Force
+	 * AUTO so the boot state matches the firmware's idle behaviour
+	 * and userspace sees a sane value through fan_mode.
+	 */
+	ret = emd_fan_set_mode(&pdev->dev, EMD_FAN_AUTO);
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "failed to set fan to AUTO on probe: %d\n", ret);
+
+	priv->hwmon_dev = devm_hwmon_device_register_with_info(
+				&pdev->dev, "emdoor_fan", priv,
+				&emd_hwmon_chip_info,
+				emd_hwmon_extra_groups);
+	if (IS_ERR(priv->hwmon_dev))
+		return PTR_ERR(priv->hwmon_dev);
+
+	priv->profile_dev = devm_platform_profile_register(
+				&pdev->dev, "epm", priv,
+				&emd_power_profile_ops);
+	if (IS_ERR(priv->profile_dev))
+		return PTR_ERR(priv->profile_dev);
+
+	dev_info(&pdev->dev,
+		 "EmdAcpi power bound (current profile=%u, fan=AUTO)\n",
+		 probe_val);
 	return 0;
 }
 
-static void emd_pl_remove(struct platform_device *pdev)
-{
-	sysfs_remove_group(&pdev->dev.kobj, &emd_pl_attr_group);
-}
-
-static struct platform_driver emd_pl_driver = {
+static struct platform_driver emd_power_driver = {
 	.driver = {
-		.name = "emdoor-power-limits",
+		.name = "emdoor-power",
 	},
-	.probe = emd_pl_probe,
-	.remove = emd_pl_remove,
+	.probe = emd_power_probe,
 };
 
+static struct platform_device *emd_power_pdev;
+
 /* ------------------------------------------------------------------------- */
-/* Keyboard RGB (DA -> WMDA, used directly)                                  */
+/* Charge platform driver (power_supply extension on BAT0)                    */
+/* ------------------------------------------------------------------------- */
+
+struct emd_charge_priv {
+	struct device *dev;
+	struct acpi_battery_hook hook;
+	struct power_supply *hooked_psy;
+};
+
+static int emd_charge_get_micp(struct emd_charge_priv *priv, u8 *val)
+{
+	return emd_ec_read(priv->dev, EMD_EC_REG_MICP, val);
+}
+
+static int emd_charge_get_mxcp(struct emd_charge_priv *priv, u8 *val)
+{
+	return emd_ec_read(priv->dev, EMD_EC_REG_MXCP, val);
+}
+
+/*
+ * Apply the firmware's invariant: MICP = MXCP - 1 (the EC clamps charge
+ * between [MICP, MXCP] as a single pair). MXCP is the user-facing upper
+ * bound; we only write MXCP here.
+ */
+static int emd_charge_set_mxcp(struct emd_charge_priv *priv, u8 val)
+{
+	u8 micp;
+	int ret;
+
+	if (val > 100)
+		return -EINVAL;
+	micp = val > 0 ? val - 1 : 0;
+
+	ret = emd_ec_write(priv->dev, EMD_EC_REG_MXCP, val);
+	if (ret)
+		return ret;
+	ret = emd_ec_write(priv->dev, EMD_EC_REG_MICP, micp);
+	return ret;
+}
+
+static int emd_charge_ext_get_property(struct power_supply *psy,
+				       const struct power_supply_ext *ext,
+				       void *data,
+				       enum power_supply_property psp,
+				       union power_supply_propval *val)
+{
+	struct emd_charge_priv *priv = data;
+	u8 v;
+	int ret;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		ret = emd_charge_get_micp(priv, &v);
+		if (ret)
+			return ret;
+		val->intval = v;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		ret = emd_charge_get_mxcp(priv, &v);
+		if (ret)
+			return ret;
+		val->intval = v;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int emd_charge_ext_set_property(struct power_supply *psy,
+				       const struct power_supply_ext *ext,
+				       void *data,
+				       enum power_supply_property psp,
+				       const union power_supply_propval *val)
+{
+	struct emd_charge_priv *priv = data;
+	u8 mxcp;
+	int ret;
+
+	if (val->intval < 0 || val->intval > 100)
+		return -EINVAL;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		/* Re-read MXCP and write the pair (MICP=val, MXCP unchanged). */
+		ret = emd_charge_get_mxcp(priv, &mxcp);
+		if (ret)
+			return ret;
+		if (val->intval >= mxcp)
+			return -EINVAL;
+		return emd_ec_write(priv->dev, EMD_EC_REG_MICP, (u8)val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		return emd_charge_set_mxcp(priv, (u8)val->intval);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int emd_charge_ext_property_is_writeable(struct power_supply *psy,
+						const struct power_supply_ext *ext,
+						void *data,
+						enum power_supply_property psp)
+{
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static const enum power_supply_property emd_charge_ext_properties[] = {
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+};
+
+static const struct power_supply_ext emd_charge_ext = {
+	.name			= "emdoor-charge",
+	.properties		= emd_charge_ext_properties,
+	.num_properties		= ARRAY_SIZE(emd_charge_ext_properties),
+	.get_property		= emd_charge_ext_get_property,
+	.set_property		= emd_charge_ext_set_property,
+	.property_is_writeable	= emd_charge_ext_property_is_writeable,
+};
+
+static int emd_charge_add_battery(struct power_supply *psy,
+				  struct acpi_battery_hook *hook)
+{
+	struct emd_charge_priv *priv = container_of(hook, struct emd_charge_priv, hook);
+	int ret;
+
+	if (priv->hooked_psy)
+		return 0;
+
+	ret = power_supply_register_extension(psy, &emd_charge_ext, priv->dev, priv);
+	if (ret)
+		return ret;
+
+	priv->hooked_psy = psy;
+	dev_info(priv->dev, "EmdAcpi charge control attached to %s\n",
+		 psy->desc->name);
+	return 0;
+}
+
+static int emd_charge_remove_battery(struct power_supply *psy,
+				     struct acpi_battery_hook *hook)
+{
+	struct emd_charge_priv *priv = container_of(hook, struct emd_charge_priv, hook);
+
+	if (priv->hooked_psy == psy) {
+		power_supply_unregister_extension(psy, &emd_charge_ext);
+		priv->hooked_psy = NULL;
+	}
+	return 0;
+}
+
+static int emd_charge_probe(struct platform_device *pdev)
+{
+	struct emd_charge_priv *priv;
+	u8 micp, mxcp;
+	int ret;
+
+	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	priv->dev = &pdev->dev;
+
+	/* Probe-time sanity read; failure here means EC IO is dead. */
+	ret = emd_charge_get_micp(priv, &micp);
+	if (ret)
+		return ret;
+	ret = emd_charge_get_mxcp(priv, &mxcp);
+	if (ret)
+		return ret;
+
+	dev_set_drvdata(&pdev->dev, priv);
+
+	priv->hook.name = dev_name(&pdev->dev);
+	priv->hook.add_battery = emd_charge_add_battery;
+	priv->hook.remove_battery = emd_charge_remove_battery;
+
+	ret = devm_battery_hook_register(&pdev->dev, &priv->hook);
+	if (ret)
+		return ret;
+
+	dev_info(&pdev->dev,
+		 "EmdAcpi charge control registered (MICP=%u, MXCP=%u)\n",
+		 micp, mxcp);
+	return 0;
+}
+
+static struct platform_driver emd_charge_driver = {
+	.driver = {
+		.name = "emdoor-charge",
+	},
+	.probe = emd_charge_probe,
+};
+
+static struct platform_device *emd_charge_pdev;
+
+/* ------------------------------------------------------------------------- */
+/* Keyboard RGB WMI driver                                                    */
 /* ------------------------------------------------------------------------- */
 
 /*
  * Keyboard RGB (DA -> WMDA, used directly)
  *
  * The DA_APP_KB_LED device (GUID 8600ACCE-FB9B-443E-86F4-3C867398AAE5)
- * implements the BST2 method via WMDA case 3. This is the only WMI
- * method that parses correctly on Linux ACPICA.
+ * implements BST2 via WMDA case 3. This is the only EmdAcpi WMI method
+ * that parses correctly on Linux ACPICA - it declares a 0x50-byte local
+ * buffer instead of 0x08, so the bogus 63-bit BufferField at offset 0x20
+ * sits inside the buffer rather than past the end. The kernel's WMI
+ * subsystem evaluates it via wmidev_evaluate_method() directly.
  *
  * The keyboard has 6 logical zones:
  *   Zone 0-3: Keyboard matrix zones (selected via FA00 FACS bits 0-3)
- *   Zone 4: Left side bar (selected via FA00 FLAB bit 4 = 0x10)
- *   Zone 5: Right side bar (selected via FA00 FLAB bit 5 = 0x20)
+ *   Zone 4:   Left side bar  (selected via FA00 FLAB bit 4 = 0x10)
+ *   Zone 5:   Right side bar (selected via FA00 FLAB bit 5 = 0x20)
  *
  * Each zone is exposed as a multicolor LED class device with RGB
- * sub-leds. The led-class-multicolor core handles color blending
- * and calls our brightness_set_blocking with the computed brightness.
+ * sub-leds. The led-class-multicolor core handles colour blending and
+ * calls our brightness_set_blocking with the computed brightness.
  */
+#define EMD_GUID_DA_APP_KB_LED		"8600ACCE-FB9B-443E-86F4-3C867398AAE5"
+
 #define EMD_WMDA_CASE_SET		0x03
 #define EMD_WMDA_CASE_GET_STATUS	0x02
 #define EMD_WMDA_DTID_KBD_TYPE		0x02
@@ -1138,25 +834,13 @@ struct emd_kbd_priv {
 	u8 mode;		/* last mode written to firmware */
 };
 
-/*
- * Apply dynamic effect mode.
- * Only zone 0's colors are sent with FA00=0 and the effect byte.
- * The EC firmware animates all zones using the same pattern.
- * Zone 1-5 color components are ignored in dynamic modes.
- */
-static int emd_kbd_apply_dynamic(struct emd_kbd_priv *priv);
-/*
- * Apply static colors to all 6 zones sequentially.
- * Zone 0 first, then zones 1-5. Returns first error.
- */
-static int emd_kbd_apply_static(struct emd_kbd_priv *priv);
-/*
- * LED multicolor brightness_set_blocking callback.
- * The led-class-multicolor core calls this when any subled intensity
- * changes. It computes color components from the cached brightness
- * (must be max_brightness=1 so components are non-zero), then sends
- * the zone's color to the EC via BST2.
- */
+/* Standard 8-byte return layout used by EmdAcpi WMxx methods. */
+struct emd_return {
+	u16 rt_code;
+	u16 value;
+	u8  reserved[4];
+} __packed;
+
 static int emd_kbd_mc_brightness_set(struct led_classdev *led_cdev,
 				     enum led_brightness brightness);
 
@@ -1198,7 +882,8 @@ static const char *const emd_kbd_reset_str = "reset";
  *   Bits 0-3 (0x01,0x02,0x04,0x08) = FACS keyboard zones 1-4
  *   Bit 4 (0x10) = FLAB left side bar
  *   Bit 5 (0x20) = FLAB right side bar
- *   0x0F = all 4 keyboard zones simultaneously (16-byte payload)
+ *   0x0F = all 4 keyboard zones simultaneously (16-byte payload) - unused:
+ *         re-arms the LLBR channel and bleeds into the side bars.
  */
 static const u8 emd_kbd_zone_sel[EMD_NUM_ZONES] = {
 	EMD_FA00_FACS_ZONE1, EMD_FA00_FACS_ZONE2,
@@ -1225,6 +910,43 @@ struct emd_bst_input {
 	u8 on;
 } __packed;
 
+static int emd_wmi_call(struct wmi_device *wdev, u8 sub,
+			const void *in, size_t in_len,
+			void *out, size_t out_size)
+{
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	struct acpi_buffer in_buf = { in_len, (void *)in };
+	acpi_status status;
+	union acpi_object *obj;
+	int ret = 0;
+
+	if (in_len && !in)
+		return -EINVAL;
+
+	status = wmidev_evaluate_method(wdev, 0, sub, &in_buf, &result);
+	if (ACPI_FAILURE(status)) {
+		ret = status == AE_AML_BUFFER_LIMIT ? -EBUSY : -EIO;
+		dev_dbg(&wdev->dev, "WMI method 0x%02x: %s\n", sub,
+			acpi_format_exception(status));
+		kfree(result.pointer);
+		return ret;
+	}
+
+	if (out && out_size) {
+		obj = result.pointer;
+		if (!obj || obj->type != ACPI_TYPE_BUFFER ||
+		    obj->buffer.length < out_size) {
+			ret = -EIO;
+			goto free;
+		}
+		memcpy(out, obj->buffer.pointer, out_size);
+	}
+
+free:
+	kfree(result.pointer);
+	return ret;
+}
+
 static int emd_kbd_mode_lookup(const char *buf, u8 *out)
 {
 	int i;
@@ -1246,10 +968,6 @@ static int emd_kbd_mode_lookup(const char *buf, u8 *out)
 	return -EINVAL;
 }
 
-/*
- * Send a BST2 input structure to the EC via WMDA case 3.
- * Returns 0 on success, negative errno on failure.
- */
 static int emd_kbd_send(struct emd_kbd_priv *priv,
 			const struct emd_bst_input *in)
 {
@@ -1260,45 +978,11 @@ static int emd_kbd_send(struct emd_kbd_priv *priv,
 			   in, sizeof(*in), &r, sizeof(r));
 	if (ret)
 		return ret;
-	if (r.rt_code != EMD_RT_OK)
+	if (r.rt_code != 0)
 		return -EIO;
 	return 0;
 }
 
-/*
- * Apply current keyboard mode to hardware.
- * Routes to static or dynamic path based on priv->mode.
- * For OFF/RESET modes, sends a minimal packet to trigger the EC.
- */
-static int emd_kbd_apply(struct emd_kbd_priv *priv)
-{
-	struct emd_bst_input in;
-
-	if (priv->mode == EMD_WMDA_FA06_OFF) {
-		memset(&in, 0, sizeof(in));
-		return emd_kbd_send(priv, &in);
-	}
-
-	if (priv->mode == EMD_WMDA_FA06_RESET) {
-		memset(&in, 0, sizeof(in));
-		in.effect = 0xFF;
-		in.on = 0xFF;
-		return emd_kbd_send(priv, &in);
-	}
-
-	if (priv->mode == EMD_WMDA_FA06_ALWAYS)
-		return emd_kbd_apply_static(priv);
-
-	return emd_kbd_apply_dynamic(priv);
-}
-
-/*
- * Apply static color to a single zone.
- * Used for mode=always (0x00). Sends per-zone FA00 with RGB and
- * effect=0xFE (skip dynamic processing).
- * The LED multicolor core calls this via brightness_set_blocking
- * after computing color components from the zone's brightness.
- */
 static int emd_kbd_apply_zone(struct emd_kbd_led *led)
 {
 	struct emd_kbd_priv *priv = led->priv;
@@ -1330,20 +1014,12 @@ static int emd_kbd_apply_zone(struct emd_kbd_led *led)
 	return emd_kbd_send(priv, &in);
 }
 
-/*
- * Apply static colors to all 6 zones sequentially.
- * Zone 0 first, then zones 1-5. Returns first error.
- */
 static int emd_kbd_apply_static(struct emd_kbd_priv *priv)
 {
-	struct emd_kbd_led *led = &priv->leds[0];
 	unsigned int i;
 	int ret;
 
-	ret = emd_kbd_apply_zone(led);
-	if (ret)
-		return ret;
-	for (i = 1; i < EMD_NUM_ZONES; i++) {
+	for (i = 0; i < EMD_NUM_ZONES; i++) {
 		ret = emd_kbd_apply_zone(&priv->leds[i]);
 		if (ret)
 			return ret;
@@ -1351,24 +1027,33 @@ static int emd_kbd_apply_static(struct emd_kbd_priv *priv)
 	return 0;
 }
 
-/*
- * Apply dynamic effect mode.
- * Only zone 0's colors are sent with FA00=0 and the effect byte.
- * The EC firmware animates all zones using the same pattern.
- * Zone 1-5 color components are ignored in dynamic modes.
- */
 static int emd_kbd_apply_dynamic(struct emd_kbd_priv *priv)
 {
 	return emd_kbd_apply_zone(&priv->leds[0]);
 }
 
-/*
- * LED multicolor brightness_set_blocking callback.
- * The led-class-multicolor core calls this when any subled intensity
- * changes. It computes color components from the cached brightness
- * (must be max_brightness=1 so components are non-zero), then sends
- * the zone's color to the EC via BST2.
- */
+static int emd_kbd_apply(struct emd_kbd_priv *priv)
+{
+	struct emd_bst_input in;
+
+	if (priv->mode == EMD_WMDA_FA06_OFF) {
+		memset(&in, 0, sizeof(in));
+		return emd_kbd_send(priv, &in);
+	}
+
+	if (priv->mode == EMD_WMDA_FA06_RESET) {
+		memset(&in, 0, sizeof(in));
+		in.effect = 0xFF;
+		in.on = 0xFF;
+		return emd_kbd_send(priv, &in);
+	}
+
+	if (priv->mode == EMD_WMDA_FA06_ALWAYS)
+		return emd_kbd_apply_static(priv);
+
+	return emd_kbd_apply_dynamic(priv);
+}
+
 static int emd_kbd_mc_brightness_set(struct led_classdev *led_cdev,
 				     enum led_brightness brightness)
 {
@@ -1393,38 +1078,38 @@ static int emd_kbd_mc_brightness_set(struct led_classdev *led_cdev,
  * Query keyboard type via WMDA case 2 (DTID=2).
  * Response: RTS0=1 (success), byte 3 = KBTE (keyboard type enum),
  * byte 5 = KBMAX (max brightness). We only support KBTE=2 (4-zone).
+ *
+ * The first call immediately after WMI bind sometimes returns KBTE=0
+ * (the EC hasn't finished initialising yet). Retry up to 3 times with
+ * a small delay before giving up.
  */
 static int emd_kbd_probe_type(struct emd_kbd_priv *priv)
 {
 	u8 args[8] = { EMD_WMDA_DTID_KBD_TYPE };
 	u8 resp[16] = { };
-	int ret;
+	int ret, tries;
 
-	ret = emd_wmi_call(priv->wdev, EMD_WMDA_CASE_GET_STATUS,
-			   args, sizeof(args), resp, sizeof(resp));
-	if (ret)
-		return ret;
+	for (tries = 0; tries < 3; tries++) {
+		ret = emd_wmi_call(priv->wdev, EMD_WMDA_CASE_GET_STATUS,
+				   args, sizeof(args), resp, sizeof(resp));
+		if (ret)
+			return ret;
 
-	if (resp[2] != 1) {
-		dev_err(&priv->wdev->dev,
-			"WMDA DTID=2 returned RTS0=%u (expected 1)\n", resp[2]);
-		return -EIO;
+		if (resp[2] != 1) {
+			dev_err(&priv->wdev->dev,
+				"WMDA DTID=2 returned RTS0=%u (expected 1)\n",
+				resp[2]);
+			return -EIO;
+		}
+		priv->kbte = resp[3];
+		priv->kbmax = resp[5];
+		if (priv->kbte != 0)
+			return 0;
+
+		msleep(50);
 	}
-	priv->kbte = resp[3];
-	priv->kbmax = resp[5];
 	return 0;
 }
-
-static ssize_t type_show(struct device *dev, struct device_attribute *attr,
-			 char *buf)
-{
-	struct emd_kbd_priv *priv = dev_get_drvdata(dev);
-
-	if (priv->kbte >= ARRAY_SIZE(emd_kbte_str) || !emd_kbte_str[priv->kbte])
-		return sysfs_emit(buf, "unknown\n");
-	return sysfs_emit(buf, "%s\n", emd_kbte_str[priv->kbte]);
-}
-static DEVICE_ATTR_RO(type);
 
 /*
  * No-op brightness handler for the mode control LED class device.
@@ -1520,33 +1205,8 @@ static DEVICE_ATTR_RO(modes);
  * lets the SteamOS udev rule (70-steam-jupiter-leds.rules) auto-chown
  * any `mode` file to deck:deck, so Decky Loader (running as the deck
  * user) can switch animation modes without root.
- *
- * The LED class's standard groups (brightness, max_brightness) come
- * from the class's dev_groups; we don't override `.groups` here. The
- * mode/modes attributes are attached via device_create_file in probe
- * after the LED class device is registered - they get cleaned up
- * automatically when the device is unregistered.
  */
 
-/*
- * WMI device attributes. `type` lives here; mode/modes moved to LED
- * class device for udev chown. Fan control is separate (power driver).
- */
-static struct attribute *emd_kbd_attrs[] = {
-	&dev_attr_type.attr,
-	NULL,
-};
-
-static const struct attribute_group emd_kbd_attr_group = {
-	.attrs = emd_kbd_attrs,
-};
-
-/*
- * Initialize a single multicolor LED for a zone.
- * Sets up subleds for R/G/B, registers with led-class-multicolor.
- * Initial brightness=1 (max_brightness) so color components flow
- * through correctly - see LED multicolor note in LTM.
- */
 static int emd_kbd_init_led(struct emd_kbd_priv *priv, unsigned int zone)
 {
 	struct emd_kbd_led *led = &priv->leds[zone];
@@ -1560,7 +1220,7 @@ static int emd_kbd_init_led(struct emd_kbd_priv *priv, unsigned int zone)
 	mc->led_cdev.brightness_set_blocking = emd_kbd_mc_brightness_set;
 	mc->led_cdev.max_brightness = 1;
 	mc->led_cdev.color = LED_COLOR_ID_RGB;
-	mc->led_cdev.brightness = 1;
+	mc->led_cdev.brightness = 1;	/* see comment below */
 	mc->num_colors = 3;
 	led->subleds[0] = (struct mc_subled){
 		.color_index = LED_COLOR_ID_RED,
@@ -1574,24 +1234,28 @@ static int emd_kbd_init_led(struct emd_kbd_priv *priv, unsigned int zone)
 		.color_index = LED_COLOR_ID_BLUE,
 		.intensity = 0,
 	};
+
+	/*
+	 * brightness must be max_brightness (1) at init: the kernel's
+	 * multi_intensity_store calls led_set_brightness(cdev,
+	 * cdev->brightness) after caching the new subled intensities;
+	 * if the cached brightness were 0, every subsequent write
+	 * would silently reduce to "off" because the handler would be
+	 * called with brightness=0. With brightness=1, brightness is
+	 * left untouched by colour writes and the cached intensity
+	 * reaches the EC.
+	 */
 	return devm_led_classdev_multicolor_register(&priv->wdev->dev, mc);
 }
 
-/*
- * Remove callback - sets the removing flag. All LED class devices are
- * devm-managed and will be automatically unregistered after the remove
- * function returns, with the brightness_set_blocking callback honoring
- * the removing flag to avoid further hardware access.
- */
 static void emd_kbd_remove(struct wmi_device *wdev)
 {
 	struct emd_kbd_priv *priv = dev_get_drvdata(&wdev->dev);
 
 	if (!priv)
 		return;
-
 	priv->removing = true;
-	/* No manual unregister – devres handles everything */
+	/* All LED class devices are devm-managed and unregister on detach. */
 }
 
 static int emd_kbd_probe(struct wmi_device *wdev, const void *context)
@@ -1630,12 +1294,6 @@ static int emd_kbd_probe(struct wmi_device *wdev, const void *context)
 	 * modes attributes. SteamOS's 70-steam-jupiter-leds.rules chowns
 	 * its `mode` file to deck:deck, which is what the Decky plugin
 	 * needs to switch animation modes without root.
-	 *
-	 * `.groups` is left NULL so the class's default groups
-	 * (brightness, max_brightness) get attached automatically.
-	 * The mode/modes attributes are then added via
-	 * device_create_file below - cleanup is automatic when the
-	 * LED class device is unregistered.
 	 */
 	priv->mode_cdev.name = "emdoor:rgb:mode";
 	priv->mode_cdev.max_brightness = 1;
@@ -1651,10 +1309,6 @@ static int emd_kbd_probe(struct wmi_device *wdev, const void *context)
 		return ret;
 
 	ret = device_create_file(priv->mode_cdev.dev, &dev_attr_modes);
-	if (ret)
-		return ret;
-
-	ret = devm_device_add_group(&wdev->dev, &emd_kbd_attr_group);
 	if (ret)
 		return ret;
 
@@ -1688,19 +1342,16 @@ static struct wmi_driver emd_kbd_driver = {
 /* Module entry                                                              */
 /* ------------------------------------------------------------------------- */
 
-static struct platform_device *emd_pl_pdev;
-
 /*
- * Module initialization - registers all 4 drivers in order:
- *   1. emdoor-power      - platform_profile via WMBF (case 1-4) with EC
- *                          PWMD (0x7C) fallback; ECWR attribute for E4 trigger
- *   2. emdoor-charge     - battery charge ratio via WMDD (case 1/2) with EC
- *                          MICP (0xBB) / MXCP (0xBC) fallback; charge_ratio
- *                          attribute sets MXCP=val, MICP=val-1
- *   3. emdoor-kbd        - 6-zone RGB keyboard via WMDA case 3 (BST2);
- *                          multicolor LED class devices + mode control surface
- *   4. emdoor-power-limits - CMS mailbox (ports 0x72/0x73) direct EC writes
- *                            for PL1-PL3, SYS_PL, GPU_PL (all in mW)
+ * Module initialization - registers 3 drivers in dependency order:
+ *   1. emdoor-power   - platform_profile + hwmon (fan1_input + fan_mode +
+ *                       power[1-6]_cap) on platform device `emdoor-power`
+ *   2. emdoor-charge  - power_supply extension on BAT0 with
+ *                       charge_control_{start,end}_threshold on platform
+ *                       device `emdoor-charge`
+ *   3. emdoor-kbd     - WMI driver for the keyboard (6 multicolor LEDs
+ *                       + mode control surface)
+ *
  * All-or-nothing: failure rolls back previous registrations.
  */
 static int __init emd_wmi_init(void)
@@ -1711,60 +1362,57 @@ static int __init emd_wmi_init(void)
 	if (ret)
 		return ret;
 
-	ret = wmi_driver_register(&emd_power_driver);
-	if (ret)
-		return ret;
+	emd_power_pdev = platform_device_register_simple("emdoor-power",
+							-1, NULL, 0);
+	if (IS_ERR(emd_power_pdev))
+		return PTR_ERR(emd_power_pdev);
 
-	ret = wmi_driver_register(&emd_charge_driver);
+	ret = platform_driver_register(&emd_power_driver);
 	if (ret) {
-		wmi_driver_unregister(&emd_power_driver);
+		platform_device_unregister(emd_power_pdev);
 		return ret;
+	}
+
+	emd_charge_pdev = platform_device_register_simple("emdoor-charge",
+							-1, NULL, 0);
+	if (IS_ERR(emd_charge_pdev)) {
+		ret = PTR_ERR(emd_charge_pdev);
+		goto err_unregister_power_driver;
+	}
+
+	ret = platform_driver_register(&emd_charge_driver);
+	if (ret) {
+		platform_device_unregister(emd_charge_pdev);
+		goto err_unregister_power_driver;
 	}
 
 	ret = wmi_driver_register(&emd_kbd_driver);
-	if (ret) {
-		wmi_driver_unregister(&emd_charge_driver);
-		wmi_driver_unregister(&emd_power_driver);
-		return ret;
-	}
-
-	/* Create platform device for power limit override sysfs */
-	emd_pl_pdev = platform_device_register_simple("emdoor-power-limits", -1, NULL, 0);
-	if (IS_ERR(emd_pl_pdev)) {
-		ret = PTR_ERR(emd_pl_pdev);
-		wmi_driver_unregister(&emd_kbd_driver);
-		wmi_driver_unregister(&emd_charge_driver);
-		wmi_driver_unregister(&emd_power_driver);
-		return ret;
-	}
-
-	ret = platform_driver_register(&emd_pl_driver);
-	if (ret) {
-		platform_device_unregister(emd_pl_pdev);
-		wmi_driver_unregister(&emd_kbd_driver);
-		wmi_driver_unregister(&emd_charge_driver);
-		wmi_driver_unregister(&emd_power_driver);
-		return ret;
-	}
+	if (ret)
+		goto err_unregister_charge_driver;
 
 	return 0;
+
+err_unregister_charge_driver:
+	platform_driver_unregister(&emd_charge_driver);
+	platform_device_unregister(emd_charge_pdev);
+err_unregister_power_driver:
+	platform_driver_unregister(&emd_power_driver);
+	platform_device_unregister(emd_power_pdev);
+	return ret;
 }
 
-/*
- * Module cleanup - reverse order of init.
- */
 static void __exit emd_wmi_exit(void)
 {
-	platform_driver_unregister(&emd_pl_driver);
-	platform_device_unregister(emd_pl_pdev);
 	wmi_driver_unregister(&emd_kbd_driver);
-	wmi_driver_unregister(&emd_charge_driver);
-	wmi_driver_unregister(&emd_power_driver);
+	platform_driver_unregister(&emd_charge_driver);
+	platform_device_unregister(emd_charge_pdev);
+	platform_driver_unregister(&emd_power_driver);
+	platform_device_unregister(emd_power_pdev);
 }
 
 module_init(emd_wmi_init);
 module_exit(emd_wmi_exit);
 
 MODULE_AUTHOR("fewtarius");
-MODULE_DESCRIPTION("EmdAcpi power, battery charge ratio, power limit override, and six-zone RGB driver (Nimo, Xuanpai, MetaMech)");
+MODULE_DESCRIPTION("EmdAcpi power, fan, charge, and six-zone RGB driver (Nimo, Xuanpai, MetaMech)");
 MODULE_LICENSE("GPL");

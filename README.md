@@ -1,97 +1,52 @@
 # emdoor-wmi
 
-Linux driver for the Emdoor EmdAcpi ACPI firmware used in Nimo, Xuanpai,
-and MetaMech laptop PCs. Provides:
+Linux driver for the Emdoor EmdAcpi ACPI firmware on Nimo, Xuanpai, and MetaMech laptop PCs. Talks to the embedded controller directly - the EmdAcpi WMI methods are broken (see "Why" below) so we route around them. Only the keyboard WMI method (`WMDA`) parses cleanly under Linux ACPICA and we evaluate that one directly.
 
-- `platform_profile` integration: select Performance, Balanced, or
-  Quiet via standard Linux sysfs.
-- Battery charge ratio control: read MICP/MXCP and write charge limits
-  via `WMDD` (with EC fallback).
-- Power limit override: write PL1-PL3, SYS_PL, GPU_PL via EC CMS
-  mailbox.
-- Six-zone RGB control: four keyboard regions plus the two chassis
-  side bars, exposed as Linux multicolor LED class devices.
-- ECWR trigger: force EC to re-apply power limits for current mode.
+| Subsystem | Linux interface | Path |
+| --- | --- | --- |
+| Power mode | `platform_profile` | `/sys/class/platform_profile/platform-profile-0/` |
+| Fan RPM | `hwmon` `fan1_input` | `/sys/class/hwmon/hwmonN/fan1_input` |
+| Fan mode (AUTO/MAX) | `hwmon` `fan_mode` (custom) | `/sys/class/hwmon/hwmonN/fan_mode` |
+| Power limits (PL1/PL2/PL3/SYS/GPU) | `hwmon` `power[1-6]_cap` | `/sys/class/hwmon/hwmonN/powerN_cap` |
+| Battery charge thresholds | `power_supply` extension on BAT0 | `/sys/class/power_supply/BAT0/charge_control_*_threshold` |
+| Keyboard RGB (6 zones + side bars) | `led-class-multicolor` | `/sys/class/leds/emdoor:multicolor:*` |
+| Animation mode | `leds` control surface | `/sys/class/leds/emdoor:rgb:mode/mode` |
 
-The driver targets the AML produced by Emdoor's "EmdAcpi" compiler and
-the EC firmware that pairs with it. It is **not** intended for
-hardware from other vendors that happen to share a GUID.
+A companion module **ecwmi** (`../ecwmi/`) provides diagnostic-only ECWR/PWMD/TLID access. Load on demand.
 
 ## Why this driver exists
 
-Fourteen of the fifteen EmdAcpi WMxx control methods declare a
-63-bit `BufferField` at offset `0x20` of an 8-byte argument buffer,
-which is structurally out-of-bounds. Linux ACPICA rejects the
-declaration with `AE_AML_BUFFER_LIMIT` before any case body runs.
+14 of the 15 EmdAcpi `WMxx` control methods declare a 63-bit `BufferField` at offset `0x20` of an 8-byte argument buffer, which is structurally out-of-bounds. Linux ACPICA rejects the declaration with `AE_AML_BUFFER_LIMIT` before any case body runs and emits a kernel log error every probe; the unreferenced field is dead code. The firmware can't be patched.
 
-The unreferenced field is dead code. We cannot patch the BIOS or
-make Linux ACPICA accept the methods. We route around them:
+For the methods we actually need:
 
-- `WMBF` (power-mode): the actual value lives in the EC's `PWMD`
-  field at `OperationRegion` offset `0x7C`. The driver tries `WMBF`
-  first; on `AE_AML_BUFFER_LIMIT` it sets a per-device quirk and
-  reads/writes `PWMD` directly for the lifetime of the device. The
-  only thing the EC fallback omits is the fan curve re-tuning that
-  `E004()` performs after `PWMD = ECPM`; `platform_profile` is not
-  affected.
-- `WMDA` (keyboard): the method is well-formed (0x50-byte local
-  buffer instead of 0x08), so we evaluate it directly via
-  `wmidev_evaluate_method()`.
-- `WMDD` (battery charge ratio): parses cleanly with an 8-byte
-  buffer. The driver tries the WMI path first and falls back to
-  direct EC reads/writes of MICP (0xBB) and MXCP (0xBC) on failure.
+- `WMBF` (power-mode): value lives in the EC `PWMD` register at `OperationRegion` offset `0x7C`. We read/write `PWMD` directly; `WMBF` is never evaluated, so no ACPI errors.
+- `WMDD` (battery charge ratio): EC's `MICP`/`MXCP` registers at offsets `0xBB`/`0xBC` carry the same values. We read/write those directly.
+- `WMDA` (keyboard): declares a 0x50-byte local buffer so the bogus `BufferField` sits inside the buffer instead of past the end. `WMDA` parses cleanly; we evaluate it via `wmidev_evaluate_method()`.
 
-Because `WMBF` and `WMDD` may evaluate on healthy firmware and fail on
-broken firmware, the driver probes the WMI path first and switches to
-the EC path transparently. The user-visible behaviour is the same in
-either case.
+EC register names and offsets are documented in `/home/deck/control/analysis/EC-RAM-MAP.md`. The full WMI call table and WMDD method internals are in `/home/deck/control/analysis/ACPI-FIRMWARE-EXTRACTION.md`.
 
 ## Supported hardware
 
 | Vendor | Product |
 | --- | --- |
-| Nimo Direct INC. | N161L (Axis)|
+| Nimo Direct INC. | N161L (Axis) |
 
-The driver carries a DMI whitelist to avoid binding to unrelated
-EmdAcpi devices. The whitelist is consulted in `emd_dmi_check()`
-during module init; if no entry matches the driver prints a message
-and returns `-ENODEV`.
+DMI whitelist gates the bind at module init. `force_load=1` skips it for diagnostics on unrecognised hardware. **Do not** add this to a persistent config - add explicit DMI strings for new vendors instead.
 
-A `force_load=1` module parameter skips the whitelist for
-diagnostics on unrecognised hardware. **Do not** add this to a
-persistent config; the whitelist exists for a reason. New vendors
-should be added with explicit DMI strings, not by silencing the
-check.
+## Modules
 
-## Module parameters
+`emdoor-wmi.ko` - production driver. Always loaded.
 
-| Parameter | Access | Description |
-| --- | --- | --- |
-| `force_load` | bool, 0444 | Skip the DMI whitelist |
+`ecwmi.ko` - diagnostic companion (sibling directory `../ecwmi/`). Exposes raw `pwmd_read`/`pwmd_write`, `tlid_read`/`tlid_write`, and `ecwr_trigger` on a WMI device under `/sys/bus/wmi/devices/D06385DE-...`. Load when debugging.
 
-The driver depends on the standard Linux WMI subsystem and on
-`CONFIG_ACPI_EC` for the EC IO fallback. There is no firmware upload
-or BIOS lock manipulation.
+Both accept `force_load=1`.
 
-## Power mode (`platform_profile`)
+## Subsystems
 
-GUID `4BCA6480-4D03-4674-84CB-26B4C8F5CFC2`. Bound as
-`emdoor-power`.
+### Power mode (`platform_profile`)
 
-The driver registers with the `platform_profile` framework, which
-exposes the standard interface at:
-
-```
-/sys/bus/wmi/devices/4BCA6480-4D03-4674-84CB-26B4C8F5CFC2-10/platform-profile/platform-profile-0/
-```
-
-| Attribute | Access | Values |
-| --- | --- | --- |
-| `profile` | rw | `low-power`, `balanced`, `performance` |
-| `choices` | ro | the three values above, space-separated |
-| `name` | ro | `epm` |
-
-Power-mode select values in the ECPM enumeration:
+Three profiles: `low-power`, `balanced`, `performance`. The driver reads/writes EC `PWMD` (0x7C) directly. After every successful write, it pulses EC `ECWR` (0x78) so the EC re-applies PL1/PL2/PL3 limits for the new mode.
 
 | ECPM | Profile |
 | --- | --- |
@@ -99,345 +54,141 @@ Power-mode select values in the ECPM enumeration:
 | 2 | Balanced |
 | 3 | Power Saver (Quiet) |
 
-`WMBF` case 4 (ECPM=4) reads back the current mode. The driver uses
-that case on healthy firmware and the EC path on broken firmware,
-transparently. The kernel's `platform_profile` core persists the
-last-selected profile across reboots; the EC firmware stores the
-current profile in `PWMD` so both paths agree on reload.
+### Fan control (`hwmon`)
 
-### ECWR attribute
-
-```
-/sys/bus/wmi/devices/4BCA6480-4D03-4674-84CB-26B4C8F5CFC2-10/ecwr
-```
-
-Write-only attribute that triggers the EC's E4 interrupt handler to
-re-apply power limits for the current mode. Used for debugging and
-manual limit refresh after CMS mailbox changes.
-
-## Battery Charge Ratio (WMDD)
-
-GUID `6B40A935-7FEF-42B6-B08D-6C79B57D6C35`. Bound as `emdoor-charge`.
-
-The driver exposes three sysfs attributes on the WMI device for controlling
-the battery charge thresholds via the EC's MICP (Min Charge Percent) and
-MXCP (Max Charge Percent) registers:
-
-```
-/sys/bus/wmi/devices/6B40A935-7FEF-42B6-B08D-6C79B57D6C35-11/
-├── charge_micp              ro
-├── charge_mxcp              ro
-└── charge_ratio             wo
-```
+`hwmon` device `emdoor_fan` on platform device `emdoor-power`. Found via `ls /sys/class/hwmon/`.
 
 | Attribute | Access | Description |
 | --- | --- | --- |
-| `charge_micp` | ro | Current minimum charge percent (0-100) |
-| `charge_mxcp` | ro | Current maximum charge percent (0-100) |
-| `charge_ratio` | wo | Write new charge limit; sets MXCP=val, MICP=val-1 |
+| `fan1_input` | ro | RPM (EC `FN1H`/`FN1L` at 0x76/0x77) |
+| `fan_mode` | rw | 1 = AUTO, 2 = MAX (EC `TLID` at 0x32; requires XXTT arm sequence) |
 
-The driver tries the WMI path first (`WMDD` case 1 for read, case 2 for
-write). If the firmware method fails, it falls back to direct EC IO on
-registers `0xBB` (MICP) and `0xBC` (MXCP), latching a per-device quirk
-flag so subsequent operations use the EC path directly.
+On probe the driver forces fan mode to AUTO. EC's `TLID` register is undefined at first power-on; the BIOS leaves it at MAX. Forcing AUTO eliminates the boot-time mismatch between firmware idle behaviour and the value visible through `fan_mode`.
 
-Per the DSDT, `WMDD` case 2 writes `Arg2` to MXCP and `Arg2-1` to MICP.
-The `charge_ratio` attribute accepts a single value (0-255, typically
-50-100) and applies this mapping automatically.
+### Power limits (`hwmon`)
 
-This is a write-only control for the charge limit; there is no firmware
-readback path for the current charge *level* (that comes from the standard
-battery sysfs).
+`power[1-6]_cap` write-only, microWatts (the EC CMS mailbox takes milliwatts; the driver divides on write). Reads return `EINVAL`.
 
-## Power Limit Override (CMS mailbox)
+| `hwmon` attr | EC register | Meaning |
+| --- | --- | --- |
+| `power1_cap` | 0x05 | PL1 (sustained) |
+| `power2_cap` | 0x06 | PL2 (short turbo) |
+| `power3_cap` | 0x07 | PL3 (peak) |
+| `power4_cap` | 0x2E | PL1_DUP (firmware mirror of PL1) |
+| `power5_cap` | 0x32 | SYS_PL (system total) |
+| `power6_cap` | 0x13 | GPU_PL |
 
-The EC exposes a Command/Data mailbox at I/O ports `0x72`/`0x73`.
-Command `0x0C` (ALIB) writes a 32-bit value to a specific register:
+CMS mailbox protocol: `outb(0x0C, 0x72) -> outb(reg, 0x73) -> outl(value, 0x73)` with small udelay between each step. The driver does this internally.
 
-```
-outb(0x0C, 0x72) -> outb(reg, 0x73) -> outl(value, 0x73)
-```
+### Battery charge thresholds (`power_supply`)
 
-The driver creates a platform device `emdoor-power-limits` with a
-`power_limits` sysfs group containing write-only attributes for each
-power limit register:
+The driver registers as a `power_supply` extension on the existing `BAT0` (or `BAT1`-`BAT4` if `BAT0` is absent) via the ACPI `battery_hook` mechanism. Standard userspace tools (`tlp`, `auto-cpufreq`) see the new properties on BAT0 with no configuration:
 
 ```
-/sys/devices/platform/emdoor-power-limits/power_limits/
-├── pl1              wo (sustained power limit, mW)
-├── pl2              wo (short turbo limit, mW)
-├── pl3              wo (peak power limit, mW)
-├── pl1_dup          wo (PL1 duplicate, some firmware mirrors PL1 here)
-├── sys_pl           wo (system total power limit, mW)
-└── gpu_pl           wo (GPU power limit, mW)
+/sys/class/power_supply/BAT0/charge_control_start_threshold   rw   MICP (0xBB)
+                                              end_threshold    rw   MXCP (0xBC)
 ```
 
-All values are in **milliwatts**. Reads return `write-only (mW)` as a
-reminder of the units. This interface is intended for debugging and
-manual tuning; the EC firmware manages limits automatically based on
-the current power mode (see `ecwr` below).
+EC semantics (per `WMDD` case 2 in DSDT):
+- `end_threshold = N` writes `MXCP = N` and `MICP = N - 1`
+- `start_threshold = M` writes `MICP = M`; the kernel rejects writes where `start >= end`
 
-## ECWR - Power Limit Refresh
+Defaults read at boot: `MICP=0, MXCP=100` (no charge limit). All four EC firmware dumps in `/home/deck/control/` confirm this.
 
-The power mode driver also exposes a write-only `ecwr` attribute on the
-WMI device:
+### Keyboard RGB (`led-class-multicolor`)
 
-```
-/sys/bus/wmi/devices/4BCA6480-4D03-4674-84CB-26B4C8F5CFC2-10/ecwr
-```
+6 zones: 4 keyboard zones (F1..F12 area split into 4 quadrants) + 2 chassis side bars. Each is a multicolor LED class device at `/sys/class/leds/emdoor:multicolor:zone{1..4}` and `/sys/class/leds/emdoor:multicolor:bar-{left,right}`. Standard `multi_intensity` attribute: `R G B`, three integers 0-255.
 
-Writing any non-zero value triggers the EC's E4 interrupt handler,
-forcing it to re-evaluate the current power mode and re-apply the
-corresponding PL1/PL2/PL3 limits. This is useful when manually
-adjusting limits via the CMS mailbox and wanting them to take effect
-immediately without a power mode change.
+Animation modes live on a virtual LED class device `/sys/class/leds/emdoor:rgb:mode/`:
 
-## Keyboard RGB
-
-GUID `8600ACCE-FB9B-443E-86F4-3C867398AAE5`. Bound as `emdoor-kbd`.
-
-### Topology
-
-The EC exposes six logical zones. 
-
-| Logical zone | Linux sysfs path | Physical location | Wire selector |
-| --- | --- | --- | --- |
-| zone1 | `emdoor:multicolor:zone1` | keyboard left quadrant | FACS bit 0 |
-| zone2 | `emdoor:multicolor:zone2` | keyboard left-of-center | FACS bit 1 |
-| zone3 | `emdoor:multicolor:zone3` | keyboard right-of-center | FACS bit 2 |
-| zone4 | `emdoor:multicolor:zone4` | keyboard right quadrant | FACS bit 3 |
-| bar-left | `emdoor:multicolor:bar-left` | left chassis side bar | FLAB bit 4 (LLB0=0) |
-| bar-right | `emdoor:multicolor:bar-right` | right chassis side bar | FLAB bit 5 (LLB0=1) |
-
-Keyboard physical layout (zones 1-4 left to right, chassis bars on
-each end):
-
-```
-+------+------+------+------+------+------+
-|      |      |      |      |      |      |
-| bar- | z1   | z2   | z3   | z4   | bar- |
-| left | left | left | right| right| right|
-|      | quad | ctr  | ctr  |      |      |
-|      |      |      |      |      |      |
-+------+------+------+------+------+------+
-```
-
-Each keyboard zone is one BST2 `FACS` selector. FACS `0x0F` would
-write all four keyboard zones in a single BST2, but the driver does
-not use it: it would re-arm the FLAB channel and bleed into the
-side bars. Per-zone writes keep each channel isolated.
-
-The FACS all-zones selector (`0x0F`) and the FLAB both-bars
-selector (`0x30`, 8-byte payload with the RGB duplicated into LLB0
-and LLB1) are valid wire encodings but the driver does not issue
-them; per-zone writes avoid the FACS-all write because it would
-re-arm the LLBR channel and re-introduce the chassis bars.
-
-### Sysfs attributes
-
-The `type` attribute lives on the keyboard WMI device. The `mode` and
-`modes` attributes live on a dedicated `emdoor:rgb:mode` LED class
-device, which is a virtual LED class device (no real LEDs) that exists
-purely as a control surface under `/sys/class/leds/`. Putting them
-under the LED class subsystem lets SteamOS's
-`70-steam-jupiter-leds.rules` udev rule auto-chown the `mode` file
-to `deck:deck`, so Decky Loader (running as the `deck` user) can
-switch animation modes without root.
-
-```
-/sys/bus/wmi/devices/8600ACCE-FB9B-443E-86F4-3C867398AAE5-12/
-└── type                    ro
-```
-
-```
-/sys/class/leds/emdoor:rgb:mode/
-├── mode                    rw
-├── modes                   ro
-├── brightness              rw   (no-op; control-surface only)
-└── max_brightness          ro   (= 1)
-```
-
-| Attribute | Values |
+| `mode` | EC behaviour |
 | --- | --- |
-| `type` (WMI) | `4zone` (only supported value) |
-| `mode` (LED class) | any of the values listed in `modes` (see below) |
-| `modes` (LED class) | space-separated list of all valid values for `mode` |
+| `always` | static, per-zone RGB |
+| `twinkle`, `wave`, `breath`, `colorcycle`, `reactive`, `ripple`, `spiralrainbow`, `rainbowripple` | dynamic; EC owns animation timing |
+| `off` | LEDs off |
+| `reset` | factory state |
 
-`modes` mirrors the kernel's `platform_profile_choices` sysfs
-attribute: read-only, space-separated list of all valid values
-accepted by `mode`. Userspace can read it to discover the supported
-set without hardcoding the OEM names. The set is fixed at module
-load and does not change at runtime.
+`modes` lists every valid value. SteamOS's `70-steam-jupiter-leds.rules` chowns the `mode` file to `deck:deck` so Decky Loader can switch modes without root.
 
-The `emdoor:rgb:mode` LED class device is a control surface, not a
-real LED. Its `brightness` and `max_brightness` attributes are
-standard LED class boilerplate; writing to `brightness` is a no-op
-because there is no LED to set. The `mode` and `modes` files are
-the actual interface.
-
-Under `/sys/class/leds/` the six zone multicolor LED class devices
-also live here:
-
-```
-emdoor:multicolor:zone1
-emdoor:multicolor:zone2
-emdoor:multicolor:zone3
-emdoor:multicolor:zone4
-emdoor:multicolor:bar-left
-emdoor:multicolor:bar-right
-```
-
-Each zone exposes the standard `led-class-multicolor` attributes:
-
-| Attribute | Description |
-| --- | --- |
-| `multi_intensity` | `R G B`, three integers 0-255 separated by a single space |
-| `multi_index` | `red green blue` (read-only) |
-| `brightness` | `0` (off) or `1` (on); `max_brightness` is `1` |
-
-### Modes (`mode`)
-
-Every effect below corresponds to one `FA06` value plus the EC's `EDTA`
-enumeration; the EC owns the animation timing and curve.
-
-| `mode` | FA06 | EC EDTA | Animation |
-| --- | --- | --- | --- |
-| `always` | 0 | 2 | static, no animation; per-zone writes are layered on top via FA06=0xFE |
-| `twinkle` | 1 | 5 | stars fade in and out independently; the EC picks which keys light up each tick |
-| `wave` | 2 | 4 | bright band sweeps across the keyboard in `EffectDirection` (default left to right) |
-| `breath` | 3 | 3 | all zones fade brightness up and down together |
-| `colorcycle` | 4 | 6 | full-keyboard rainbow cycle; zone RGB drives only the static-baseline reference |
-| `reactive` | 5 | 7 | reactive press flash; not animated without a key-event source, so on Linux it sits on the zone RGB until input attaches |
-| `ripple` | 6 | 8 | ripple spreads out from a key press; without a key source this renders as a static gradient on the EC |
-| `spiralrainbow` | 7 | 9 | spiral/centripetal rainbow sweep |
-| `rainbowripple` | 8 | 10 | rainbow-tinted ripple |
-| `off` | - | - | FA06=0xFE, FA07=0; turns the keyboard off |
-| `reset` | - | - | FA06=0xFF, FA07=0xFF; factory state |
-
-In `always` mode the driver sends a BST2 baseline first (which also
-runs `ECMB=0x18` with `FA01`/`FA02`/`FA03`), then per-zone writes
-with `FA06=0xFE` so BST2 skips the baseline and only updates the
-targeted FACS or FLAB channel. Re-running the baseline between
-zones would clobber every other zone with the per-zone colour;
-empirically this presents as flicker.
-
-Dynamic modes (anything other than `always`) only need one BST2 per
-write: `FA00=0`, `FA06=mode`, the per-zone RGB goes into the EC, and
-the EC animates it. The driver does not re-issue every zone on each
-dynamic write; a single BST2 with `FA00=0` is enough.
-
-### Probe behaviour
-
-On probe the driver:
-
-1. Reads the keyboard type via `WMDA` case 2 (`DTID=2`). Anything
-   other than `KBTE=2` (4-zone) is rejected with `-ENODEV`. Devices
-   reporting `KBTE=1` (BST1 single-colour) or `KBTE=3` (BST3
-   per-key) deliberately do not bind; the BST2 wire format is
-   meaningless to them.
-2. Registers six multicolor LED class devices, one per logical zone.
-3. Registers the `type` attribute on the WMI device and the
-   `mode` / `modes` attributes on the `emdoor:rgb:mode` LED class
-   control surface.
-4. **Does not** apply an initial RGB state. The hardware is left
-   exactly as the firmware last had it, so a reload does not stomp
-   the user's colours.
-
-### Behaviour on `rmmod`
-
-The keyboard driver implements `remove` to unregister LED class
-devices without writing to hardware. The power mode and RGB state
-survive `rmmod`/`insmod` cycles; only the sysfs interface comes and
-goes.
-
-This is intentional: the firmware holds the last configuration, and
-there is no per-zone RGB readback path. The driver cannot recover
-the cached values on a fresh probe, so sysfs shows the conservative
-default `brightness=1 intensity=0 0 0` per zone on load. Writing to
-`multi_intensity` applies to the hardware normally; the next
-`rmmod`/`insmod` cycle still leaves the colours in place.
-
-### Caveats
-
-- The intensity value is canonical in Linux's per-led-class-attribute
-  way; `brightness` is a 0/1 toggle. The driver intentionally keeps
-  `brightness=1` (logical "on") at probe so that `multi_intensity`
-  writes flow through to hardware. The kernel's
-  `multi_intensity_store` calls
-  `led_set_brightness(cdev, cdev->brightness)` after caching the
-  new subled intensities; if the cached brightness were `0`, every
-  subsequent write would silently reduce to "off" because the
-  handler would be called with `brightness=0`. With `brightness=1`,
-  brightness is left untouched by colour writes and the cached
-  intensity reaches the EC.
-- The driver's `mode_store` and brightness handlers all go through
-  `priv->lock`. Multi-zone updates are not atomic across
-  `multi_intensity` writes because Linux exposes per-zone
-  attributes, but each individual zone write is atomic at the WMI
-  boundary.
-- `force_load=1` is **not** a workaround for unsupported keyboards;
-  if the firmware reports `KBTE != 2` the driver still refuses to
-  bind.
+The driver does **not** apply an initial RGB state on probe; hardware is left as the firmware last had it, so `rmmod`/`insmod` does not stomp user colours.
 
 ## Build
 
 ```sh
+# Production driver
+cd /home/deck/control/emdoor-wmi
+make
+
+# Diagnostic companion
+cd /home/deck/control/ecwmi
 make
 ```
 
-The `Makefile` builds against `/lib/modules/$(uname -r)/build` by
-default. To target a different tree:
-
-```sh
-make KDIR=/path/to/kernel/build
-```
-
-`make install` runs `modules_install` and `depmod -a`.
+Both `Makefile`s build against `/lib/modules/$(uname -r)/build` by default. Override with `KDIR=...`.
 
 ## Load
 
 ```sh
-sudo insmod emdoor-wmi.ko
-sudo depmod -a
+sudo insmod /home/deck/control/emdoor-wmi/emdoor-wmi.ko
+# Diagnostic companion (opt-in)
+sudo insmod /home/deck/control/ecwmi/ecwmi.ko
 ```
 
-udev auto-loads on boot once the module is installed; the DMI
-whitelist gates the bind.
+udev auto-loads `emdoor-wmi` on boot once installed; the DMI whitelist gates the bind.
 
 ## Diagnostics
 
 ```sh
-# Confirm the WMI devices exist
-ls /sys/bus/wmi/devices/ | grep -E '4BCA|8600ACCE|6B40A935'
+# Power mode
+cat /sys/class/platform_profile/platform-profile-0/profile
+echo balanced | sudo tee /sys/class/platform_profile/platform-profile-0/profile
 
-# List valid modes
-cat /sys/class/leds/emdoor:rgb:mode/modes
+# Fan
+HWMON=/sys/class/hwmon/hwmon$(ls /sys/class/hwmon/ | grep -o '[0-9]*' | head -1)
+cat $HWMON/fan1_input
+echo 1 | sudo tee $HWMON/fan_mode     # AUTO
 
-# Check battery charge ratio
-cat /sys/bus/wmi/devices/6B40A935-7FEF-42B6-B08D-6C79B57D6C35-11/charge_micp
-cat /sys/bus/wmi/devices/6B40A935-7FEF-42B6-B08D-6C79B57D6C35-11/charge_mxcp
+# Battery charge limits
+cat /sys/class/power_supply/BAT0/charge_control_end_threshold
+echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
 
-# Check power limit override interface
-ls /sys/devices/platform/emdoor-power-limits/power_limits/
+# RGB
+echo 255 0 0 | sudo tee /sys/class/leds/emdoor:multicolor:zone1/multi_intensity
+echo wave | sudo tee /sys/class/leds/emdoor:rgb:mode/mode
 
-# Tail the kernel ring buffer
-sudo dmesg -w | grep -E 'emdoor|EmdAcpi'
+# Watch the kernel ring buffer
+sudo dmesg -w | grep -E 'emdoor|EmdAcpi|ecwmi'
 ```
 
-Probe failure modes and what they mean:
+### Probe messages
 
-| Symptom | Likely cause |
+| Message | Meaning |
 | --- | --- |
-| No `emdoor-power`, `emdoor-charge`, or `emdoor-kbd` devices | DMI whitelist did not match (load with `force_load=1` to confirm) |
-| `EmdAcpi power mode bound (...) WMI path` | Healthy firmware, fast path |
-| `EmdAcpi power mode bound (...) EC IO fallback` | `WMBF` is broken; driver routed around it via `PWMD` |
-| `EmdAcpi battery charge ratio bound (...) EC IO fallback` | `WMDD` is broken; driver routed around it via EC MICP/MXCP registers |
-| `unsupported keyboard type 0xNN` | `KBTE` is not 2; this driver only supports the 4-zone layout |
-| `WMDA DTID=2 returned RTS0=N` | First-byte check failed; firmware returned an unexpected value (do not retry, the firmware is misbehaving) |
+| `EmdAcpi power bound (current profile=N, fan=AUTO)` | EC IO working; PWMD was N, fan forced to AUTO |
+| `EmdAcpi charge control attached to BAT0` | Charge threshold extension registered |
+| `EmdAcpi keyboard backlight bound (type=4zone max=0 mode=always)` | Keyboard WMI driver bound |
+| No ACPI BIOS Errors at probe | Confirmed: driver doesn't evaluate broken WMI methods |
+
+If `EmdAcpi power bound` doesn't appear, the DMI whitelist didn't match - try `force_load=1` to confirm.
+
+## EC register map
+
+Authoritative source: `/home/deck/control/analysis/EC-RAM-MAP.md` (DSDT line 8680, `OperationRegion (ECF2, EmbeddedControl, Zero, 0xFF)`).
+
+Registers the driver uses:
+
+| Offset | Name | Use |
+| --- | --- | --- |
+| 0x30 | XXTT | Fan control arm (write 0x11 before TLID) |
+| 0x32 | TLID | Fan mode (1=AUTO, 2=MAX) |
+| 0x76/0x77 | FN1H/FN1L | Fan 1 RPM |
+| 0x78 | ECWR | Power-limit refresh trigger |
+| 0x7C | PWMD | Power mode (1=perf, 2=bal, 3=quiet) |
+| 0xBB | MICP | Min charge percent |
+| 0xBC | MXCP | Max charge percent |
+
+CMS mailbox ports (for `power[1-6]_cap`): cmd 0x72, data 0x73, ALIB command 0x0C.
 
 ## License
 
-SPDX-License-Identifier: GPL-2.0-or-later
-
-The driver is distributed under the GNU General Public License
-version 2 or later, the same terms as the Linux kernel.
+SPDX-License-Identifier: GPL-2.0-or-later.
