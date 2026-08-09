@@ -1,17 +1,15 @@
 # emdoor-wmi - Linux hardware support for Nimo Axis laptops
 
-A Linux kernel module for the Nimo Axis (and other Emdoor EmdAcpi-based laptops) that enables full hardware control through standard kernel interfaces. It talks to the laptop's embedded controller directly, bypassing the firmware's broken WMI methods, so every control works through interfaces that desktop tools, `tlp`, `auto-cpufreq`, and LED settings already understand.
+A Linux kernel module for the Nimo Axis (and other Emdoor EmdAcpi-based laptops) that enables full hardware control through standard kernel interfaces. It talks to the laptop's embedded controller directly, bypassing the firmware's broken WMI methods, so every control works through interfaces that desktop tools and LED settings already understand.
 
 ## Features
 
-- **Power mode switching** (`platform_profile`) - Switch between performance, balanced, and quiet modes. Writes go directly to the EC's `PWMD` register; the EC re-applies power limits automatically.
-- **Fan monitoring & control** (`hwmon`) - Read fan RPM via `fan1_input` and switch between AUTO and MAX with `fan_mode`. The driver forces AUTO on boot to match firmware idle behaviour.
-- **Power limit configuration** (`hwmon`) - Set PL1/PL2/PL3, system total, and GPU power caps in microWatts via `power[1-6]_cap`. Uses the EC CMS mailbox protocol internally.
-- **Battery charge thresholds** (`power_supply`) - Extend the existing `BAT0` sysfs with `charge_control_start_threshold` and `charge_control_end_threshold` so you can cap charge at 80% (or any value) to preserve battery health. Works with `tlp` and `auto-cpufreq` out of the box.
-- **Per-zone keyboard RGB** (`led-class-multicolor`) - Control 4 keyboard zones plus 2 chassis side bars independently via `multi_intensity`. Standard `R G B` values, 0-255 per channel.
-- **RGB animation modes** (`led-class`) - Switch between static, wave, breath, rainbow, reactive, and other dynamic effects via the `emdoor:rgb:mode` control surface.
-
-A companion module **ecwmi** (`../ecwmi/`) provides diagnostic-only raw EC register access. Load on demand when debugging.
+- **Power mode switching** (`platform_profile`) - Switch between performance, balanced, and quiet modes.
+- **Fan monitoring & control** (`hwmon`) - Read fan RPM and switch between AUTO and MAX modes.
+- **Power limit configuration** (`hwmon`) - Set PL1/PL2/PL3, system total, and GPU power caps in microWatts.
+- **Battery charge thresholds** (`power_supply`) - Cap battery charge at any percentage to preserve battery health.
+- **Per-zone keyboard RGB** (`led-class-multicolor`) - Control 4 keyboard zones plus 2 chassis side bars independently.
+- **RGB animation modes** (`led-class`) - Switch between static, wave, breath, rainbow, reactive, and other effects.
 
 ## Why this driver exists (technical)
 
@@ -36,10 +34,6 @@ DMI whitelist gates the bind at module init. `force_load=1` skips it for diagnos
 ## Modules
 
 `emdoor-wmi.ko` - production driver. Always loaded.
-
-`ecwmi.ko` - diagnostic companion (sibling directory `../ecwmi/`). Exposes raw `pwmd_read`/`pwmd_write`, `tlid_read`/`tlid_write`, and `ecwr_trigger` on a WMI device under `/sys/bus/wmi/devices/D06385DE-...`. Load when debugging.
-
-Both accept `force_load=1`.
 
 ## Subsystems
 
@@ -81,7 +75,7 @@ CMS mailbox protocol: `outb(0x0C, 0x72) -> outb(reg, 0x73) -> outl(value, 0x73)`
 
 ### Battery charge thresholds (`power_supply`)
 
-The driver registers as a `power_supply` extension on the existing `BAT0` (or `BAT1`-`BAT4` if `BAT0` is absent) via the ACPI `battery_hook` mechanism. Standard userspace tools (`tlp`, `auto-cpufreq`) see the new properties on BAT0 with no configuration:
+The driver registers as a `power_supply` extension on the existing `BAT0` (or `BAT1`-`BAT4` if `BAT0` is absent) via the ACPI `battery_hook` mechanism. The new properties appear on `BAT0` with no additional configuration:
 
 ```
 /sys/class/power_supply/BAT0/charge_control_start_threshold   rw   MICP (0xBB)
@@ -114,16 +108,11 @@ The driver does **not** apply an initial RGB state on probe; hardware is left as
 ## Build
 
 ```sh
-# Production driver
 cd /home/deck/control/emdoor-wmi
-make
-
-# Diagnostic companion
-cd /home/deck/control/ecwmi
 make
 ```
 
-Both `Makefile`s build against `/lib/modules/$(uname -r)/build` by default. Override with `KDIR=...`.
+The `Makefile` builds against `/lib/modules/$(uname -r)/build` by default. Override with `KDIR=...`.
 
 ## Install via DKMS (recommended)
 
@@ -181,8 +170,6 @@ sudo dkms install -m emdoor-wmi -v ${VERSION}
 
 ```sh
 sudo insmod /home/deck/control/emdoor-wmi/emdoor-wmi.ko
-# Diagnostic companion (opt-in)
-sudo insmod /home/deck/control/ecwmi/ecwmi.ko
 ```
 
 udev auto-loads `emdoor-wmi` on boot once installed; the DMI whitelist gates the bind.
@@ -208,7 +195,7 @@ echo 255 0 0 | sudo tee /sys/class/leds/emdoor:multicolor:zone1/multi_intensity
 echo wave | sudo tee /sys/class/leds/emdoor:rgb:mode/mode
 
 # Watch the kernel ring buffer
-sudo dmesg -w | grep -E 'emdoor|EmdAcpi|ecwmi'
+sudo dmesg -w | grep -E 'emdoor|EmdAcpi'
 ```
 
 ### Probe messages
