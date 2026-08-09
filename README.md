@@ -1,20 +1,19 @@
-# emdoor-wmi
+# emdoor-wmi - Linux hardware support for Nimo Axis laptops
 
-Linux driver for the Emdoor EmdAcpi ACPI firmware on Nimo, Xuanpai, and MetaMech laptop PCs. Talks to the embedded controller directly - the EmdAcpi WMI methods are broken (see "Why" below) so we route around them. Only the keyboard WMI method (`WMDA`) parses cleanly under Linux ACPICA and we evaluate that one directly.
+A Linux kernel module for the Nimo Axis (and other Emdoor EmdAcpi-based laptops) that enables full hardware control through standard kernel interfaces. It talks to the laptop's embedded controller directly, bypassing the firmware's broken WMI methods, so every control works through interfaces that desktop tools, `tlp`, `auto-cpufreq`, and LED settings already understand.
 
-| Subsystem | Linux interface | Path |
-| --- | --- | --- |
-| Power mode | `platform_profile` | `/sys/class/platform_profile/platform-profile-0/` |
-| Fan RPM | `hwmon` `fan1_input` | `/sys/class/hwmon/hwmonN/fan1_input` |
-| Fan mode (AUTO/MAX) | `hwmon` `fan_mode` (custom) | `/sys/class/hwmon/hwmonN/fan_mode` |
-| Power limits (PL1/PL2/PL3/SYS/GPU) | `hwmon` `power[1-6]_cap` | `/sys/class/hwmon/hwmonN/powerN_cap` |
-| Battery charge thresholds | `power_supply` extension on BAT0 | `/sys/class/power_supply/BAT0/charge_control_*_threshold` |
-| Keyboard RGB (6 zones + side bars) | `led-class-multicolor` | `/sys/class/leds/emdoor:multicolor:*` |
-| Animation mode | `leds` control surface | `/sys/class/leds/emdoor:rgb:mode/mode` |
+## Features
 
-A companion module **ecwmi** (`../ecwmi/`) provides diagnostic-only ECWR/PWMD/TLID access. Load on demand.
+- **Power mode switching** (`platform_profile`) - Switch between performance, balanced, and quiet modes. Writes go directly to the EC's `PWMD` register; the EC re-applies power limits automatically.
+- **Fan monitoring & control** (`hwmon`) - Read fan RPM via `fan1_input` and switch between AUTO and MAX with `fan_mode`. The driver forces AUTO on boot to match firmware idle behaviour.
+- **Power limit configuration** (`hwmon`) - Set PL1/PL2/PL3, system total, and GPU power caps in microWatts via `power[1-6]_cap`. Uses the EC CMS mailbox protocol internally.
+- **Battery charge thresholds** (`power_supply`) - Extend the existing `BAT0` sysfs with `charge_control_start_threshold` and `charge_control_end_threshold` so you can cap charge at 80% (or any value) to preserve battery health. Works with `tlp` and `auto-cpufreq` out of the box.
+- **Per-zone keyboard RGB** (`led-class-multicolor`) - Control 4 keyboard zones plus 2 chassis side bars independently via `multi_intensity`. Standard `R G B` values, 0-255 per channel.
+- **RGB animation modes** (`led-class`) - Switch between static, wave, breath, rainbow, reactive, and other dynamic effects via the `emdoor:rgb:mode` control surface.
 
-## Why this driver exists
+A companion module **ecwmi** (`../ecwmi/`) provides diagnostic-only raw EC register access. Load on demand when debugging.
+
+## Why this driver exists (technical)
 
 14 of the 15 EmdAcpi `WMxx` control methods declare a 63-bit `BufferField` at offset `0x20` of an 8-byte argument buffer, which is structurally out-of-bounds. Linux ACPICA rejects the declaration with `AE_AML_BUFFER_LIMIT` before any case body runs and emits a kernel log error every probe; the unreferenced field is dead code. The firmware can't be patched.
 
