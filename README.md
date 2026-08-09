@@ -11,11 +11,9 @@ A Linux kernel module for the Nimo Axis (and other Emdoor EmdAcpi-based laptops)
 - **Per-zone keyboard RGB** (`led-class-multicolor`) - Control 4 keyboard zones plus 2 chassis side bars independently.
 - **RGB animation modes** (`led-class`) - Switch between static, wave, breath, rainbow, reactive, and other effects.
 
-## Why this driver exists (technical)
+## Technical approach
 
-14 of the 15 EmdAcpi `WMxx` control methods declare a 63-bit `BufferField` at offset `0x20` of an 8-byte argument buffer, which is structurally out-of-bounds. Linux ACPICA rejects the declaration with `AE_AML_BUFFER_LIMIT` before any case body runs and emits a kernel log error every probe; the unreferenced field is dead code. The firmware can't be patched.
-
-For the methods we actually need:
+The EmdAcpi firmware exposes hardware controls through ACPI/WMI methods, but 14 of the 15 `WMxx` methods declare a 63-bit `BufferField` at offset `0x20` of an 8-byte argument buffer, which is structurally out-of-bounds. Linux ACPICA rejects the declaration with `AE_AML_BUFFER_LIMIT` before any case body runs and emits a kernel log error every probe; the unreferenced field is dead code and the firmware can't be patched. Rather than evaluating the broken methods, this driver routes around them by talking to the laptop's embedded controller (EC) directly. For the methods we actually need:
 
 - `WMBF` (power-mode): value lives in the EC `PWMD` register at `OperationRegion` offset `0x7C`. We read/write `PWMD` directly; `WMBF` is never evaluated, so no ACPI errors.
 - `WMDD` (battery charge ratio): EC's `MICP`/`MXCP` registers at offsets `0xBB`/`0xBC` carry the same values. We read/write those directly.
