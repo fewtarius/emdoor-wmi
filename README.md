@@ -126,7 +126,59 @@ make
 
 Both `Makefile`s build against `/lib/modules/$(uname -r)/build` by default. Override with `KDIR=...`.
 
-## Load
+## Install via DKMS (recommended)
+
+DKMS (Dynamic Kernel Module Support) automatically rebuilds the module when a new kernel is installed.
+
+### Prerequisites
+
+Install DKMS and kernel headers for your distribution:
+
+```sh
+# Debian/Ubuntu
+sudo apt install dkms linux-headers-$(uname -r)
+
+# Fedora
+sudo dnf install dkms kernel-devel-$(uname -r)
+
+# Arch
+sudo pacman -S dkms linux-headers
+```
+
+### Installation
+
+```sh
+cd /home/deck/control/emdoor-wmi
+sudo ./dkms-install.sh
+```
+
+The helper script copies the source to `/usr/src/emdoor-wmi-<version>/`, adds it to DKMS, builds for the current kernel, and installs it.
+
+### DKMS commands
+
+```sh
+# Check status
+sudo ./dkms-install.sh status
+# or: dkms status -m emdoor-wmi
+
+# Rebuild for current kernel only
+sudo ./dkms-install.sh build
+
+# Remove from DKMS (uninstalls from all kernels)
+sudo ./dkms-install.sh remove
+```
+
+### Manual DKMS steps (if not using the helper script)
+
+```sh
+VERSION=$(cat VERSION)
+sudo cp -r . /usr/src/emdoor-wmi-${VERSION}/
+sudo dkms add -m emdoor-wmi -v ${VERSION}
+sudo dkms build -m emdoor-wmi -v ${VERSION}
+sudo dkms install -m emdoor-wmi -v ${VERSION}
+```
+
+## Load (manual, without DKMS)
 
 ```sh
 sudo insmod /home/deck/control/emdoor-wmi/emdoor-wmi.ko

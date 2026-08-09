@@ -14,6 +14,9 @@
 Module.symvers
 modules.order
 
+# DKMS build artifacts
+*.tar.gz
+
 # CLIO (managed automatically)
 .clio/*
 !.clio/instructions.md
